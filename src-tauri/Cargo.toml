@@ -1,0 +1,39 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2", features = [] }
+tauri-plugin-log = "2"
+anyhow = "1"
+thiserror = "2"
+aes-gcm = "0.10"
+getrandom = "0.3"
+base64 = "0.22"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "io-util"] }
+futures-util = "0.3"
+sysinfo = "0.33"
+nvml-wrapper = "0.11"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+which = "6"
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+zip = "2"

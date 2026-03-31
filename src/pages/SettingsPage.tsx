@@ -1,4 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -158,6 +159,10 @@ export function SettingsPage() {
     setCfg((c) => ({ ...c, translate: { ...c.translate, ...patch } }));
   };
 
+  const setSegmentation = (patch: Partial<AppConfig["segmentation"]>) => {
+    setCfg((c) => ({ ...c, segmentation: { ...c.segmentation, ...patch } }));
+  };
+
   const setSubtitle = (patch: Partial<AppConfig["subtitle"]>) => {
     setCfg((c) => ({ ...c, subtitle: { ...c.subtitle, ...patch } }));
   };
@@ -262,7 +267,7 @@ export function SettingsPage() {
       )}
 
       <section className="card">
-        <h2>A. 翻译引擎与 LLM</h2>
+        <h2>翻译引擎与 LLM</h2>
         <div className="field-grid two">
           <label className="field whisper-model-select">
             <span>翻译引擎</span>
@@ -431,7 +436,7 @@ export function SettingsPage() {
       </section>
 
       <section className="card">
-        <h2>B. Whisper 与模型下载</h2>
+        <h2>Whisper 与模型下载</h2>
         {!hw && !loadErr ? (
           <p className="muted" style={{ margin: "0 0 0.75rem" }}>
             正在加载 CPU / 内存 / GPU 信息与模型列表…
@@ -782,13 +787,19 @@ export function SettingsPage() {
                           type="button"
                           disabled={modelBusy || !m.downloaded}
                           onClick={() => {
-                            if (!window.confirm(`删除本地文件 ${m.file_name}？`)) return;
-                            setModelErr(null);
-                            setModelBusy(true);
-                            void deleteWhisperModel(m.id)
-                              .then(() => refreshWhisperPanel(cfg.whisper.use_gpu))
-                              .catch((e) => setModelErr(String(e)))
-                              .finally(() => setModelBusy(false));
+                            void (async () => {
+                              const ok = await confirm(`删除本地文件 ${m.file_name}？`, {
+                                title: "SubForge",
+                                kind: "warning",
+                              });
+                              if (!ok) return;
+                              setModelErr(null);
+                              setModelBusy(true);
+                              void deleteWhisperModel(m.id)
+                                .then(() => refreshWhisperPanel(cfg.whisper.use_gpu))
+                                .catch((e) => setModelErr(String(e)))
+                                .finally(() => setModelBusy(false));
+                            })();
                           }}
                         >
                           删除
@@ -807,133 +818,209 @@ export function SettingsPage() {
       </section>
 
       <section className="card">
-        <h2>C. 翻译策略与术语</h2>
-        {!translateSectionVisible ? (
-          <p className="muted" style={{ margin: 0 }}>
-            当前为「仅原文字幕」或翻译关闭，策略与术语在运行流水线中不会生效。
+        <h2>翻译与原字幕分段</h2>
+        <div className="field-grid two">
+          <label className="field">
+            <span>原字幕分段策略</span>
+            <select
+              value={cfg.segmentation.strategy}
+              onChange={(e) => setSegmentation({ strategy: e.target.value })}
+            >
+              <option value="disabled">关闭（沿用 Whisper 原始分段）</option>
+              <option value="auto">自动</option>
+              <option value="rules_only">规则优先</option>
+              <option value="llm_preferred">LLM 优先</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>分段时间策略</span>
+            <select
+              value={cfg.segmentation.timing_mode}
+              onChange={(e) => setSegmentation({ timing_mode: e.target.value })}
+            >
+              <option value="word_timestamps_first">词级时间优先</option>
+              <option value="approximate_reflow">近似对齐</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>单条字幕最大字符数</span>
+            <input
+              type="number"
+              min={8}
+              max={500}
+              value={cfg.segmentation.max_chars_per_segment}
+              onChange={(e) =>
+                setSegmentation({
+                  max_chars_per_segment: Number(e.target.value) || 42,
+                })
+              }
+            />
+          </label>
+          <label className="field">
+            <span>单条字幕最大时长（秒）</span>
+            <input
+              type="number"
+              min={1}
+              max={60}
+              step="0.5"
+              value={cfg.segmentation.max_duration_seconds}
+              onChange={(e) =>
+                setSegmentation({
+                  max_duration_seconds: Number(e.target.value) || 6,
+                })
+              }
+            />
+          </label>
+        </div>
+        {cfg.segmentation.strategy === "auto" ? (
+          <p className="muted" style={{ margin: "0.75rem 0 0" }}>
+            自动模式下，已配置 LLM 时优先使用 LLM 断句；未配置时自动回退为规则分段。
           </p>
-        ) : (
-          <>
-            <div className="field-grid two">
-              <label className="field">
-                <span>风格</span>
-                <select
-                  value={cfg.translate.style}
-                  onChange={(e) => setTranslate({ style: e.target.value })}
+        ) : null}
+        {cfg.segmentation.strategy === "llm_preferred" &&
+        cfg.translator.engine !== "llm" ? (
+          <p className="muted" style={{ margin: "0.75rem 0 0" }}>
+            当前原字幕分段为「LLM 优先」。若未保存可用的 LLM 参数与 API Key，开始任务时会直接提示并阻止入队。
+          </p>
+        ) : null}
+
+        <div style={{ marginTop: "1rem" }}>
+          <h3 style={{ margin: "0 0 0.75rem", fontSize: "1rem" }}>翻译策略与术语</h3>
+          {!translateSectionVisible ? (
+            <p className="muted" style={{ margin: 0 }}>
+              当前为「仅原文字幕」或翻译关闭，以下翻译策略与术语在运行流水线中不会生效。
+            </p>
+          ) : (
+            <>
+              <div className="field-grid two">
+                <label className="field">
+                  <span>风格</span>
+                  <select
+                    value={cfg.translate.style}
+                    onChange={(e) => setTranslate({ style: e.target.value })}
+                  >
+                    <option value="literal">直译</option>
+                    <option value="natural">自然表达</option>
+                    <option value="term_first">术语优先</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span>每段最大字符</span>
+                  <input
+                    type="number"
+                    min={64}
+                    max={32000}
+                    value={cfg.translate.max_segment_chars}
+                    onChange={(e) =>
+                      setTranslate({
+                        max_segment_chars: Number(e.target.value) || 800,
+                      })
+                    }
+                  />
+                </label>
+                <label
+                  className="field"
+                  style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}
                 >
-                  <option value="literal">直译</option>
-                  <option value="natural">自然表达</option>
-                  <option value="term_first">术语优先</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>每段最大字符</span>
-                <input
-                  type="number"
-                  min={64}
-                  max={32000}
-                  value={cfg.translate.max_segment_chars}
-                  onChange={(e) =>
-                    setTranslate({
-                      max_segment_chars: Number(e.target.value) || 800,
-                    })
-                  }
-                />
-              </label>
-              <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-                <input
-                  type="checkbox"
-                  checked={cfg.translate.keep_proper_nouns_in_source}
-                  onChange={(e) =>
-                    setTranslate({
-                      keep_proper_nouns_in_source: e.target.checked,
-                    })
-                  }
-                />
-                <span>保留原文专有名词</span>
-              </label>
-              <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-                <input
-                  type="checkbox"
-                  checked={cfg.translate.glossary_case_sensitive}
-                  onChange={(e) =>
-                    setTranslate({ glossary_case_sensitive: e.target.checked })
-                  }
-                />
-                <span>术语整词匹配区分大小写</span>
-              </label>
-            </div>
-            <div style={{ marginTop: "0.75rem" }}>
-              <div className="row-actions" style={{ marginBottom: "0.5rem" }}>
-                <button type="button" onClick={addGlossaryRow}>
-                  添加术语行
-                </button>
+                  <input
+                    type="checkbox"
+                    checked={cfg.translate.keep_proper_nouns_in_source}
+                    onChange={(e) =>
+                      setTranslate({
+                        keep_proper_nouns_in_source: e.target.checked,
+                      })
+                    }
+                  />
+                  <span>保留原文专有名词</span>
+                </label>
+                <label
+                  className="field"
+                  style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={cfg.translate.glossary_case_sensitive}
+                    onChange={(e) =>
+                      setTranslate({ glossary_case_sensitive: e.target.checked })
+                    }
+                  />
+                  <span>术语整词匹配区分大小写</span>
+                </label>
               </div>
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
-                  <thead>
-                    <tr style={{ textAlign: "left", color: "var(--muted)" }}>
-                      <th style={{ padding: "0.35rem" }}>原文</th>
-                      <th style={{ padding: "0.35rem" }}>译文</th>
-                      <th style={{ padding: "0.35rem" }}>备注</th>
-                      <th style={{ padding: "0.35rem" }} />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {cfg.translate.glossary.length === 0 ? (
-                      <tr>
-                        <td
-                          colSpan={4}
-                          className="muted"
-                          style={{ padding: "0.5rem" }}
-                        >
-                          暂无术语。点击「添加术语行」可录入；全部留空不影响任务运行。
-                        </td>
+              <div style={{ marginTop: "0.75rem" }}>
+                <div className="row-actions" style={{ marginBottom: "0.5rem" }}>
+                  <button type="button" onClick={addGlossaryRow}>
+                    添加术语行
+                  </button>
+                </div>
+                <div style={{ overflowX: "auto" }}>
+                  <table
+                    style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}
+                  >
+                    <thead>
+                      <tr style={{ textAlign: "left", color: "var(--muted)" }}>
+                        <th style={{ padding: "0.35rem" }}>原文</th>
+                        <th style={{ padding: "0.35rem" }}>译文</th>
+                        <th style={{ padding: "0.35rem" }}>备注</th>
+                        <th style={{ padding: "0.35rem" }} />
                       </tr>
-                    ) : null}
-                    {cfg.translate.glossary.map((row, i) => (
-                      <tr key={i}>
-                        <td style={{ padding: "0.25rem" }}>
-                          <input
-                            value={row.source}
-                            onChange={(e) =>
-                              patchGlossary(i, { source: e.target.value })
-                            }
-                          />
-                        </td>
-                        <td style={{ padding: "0.25rem" }}>
-                          <input
-                            value={row.target}
-                            onChange={(e) =>
-                              patchGlossary(i, { target: e.target.value })
-                            }
-                          />
-                        </td>
-                        <td style={{ padding: "0.25rem" }}>
-                          <input
-                            value={row.note}
-                            onChange={(e) =>
-                              patchGlossary(i, { note: e.target.value })
-                            }
-                          />
-                        </td>
-                        <td style={{ padding: "0.25rem" }}>
-                          <button type="button" onClick={() => removeGlossary(i)}>
-                            删除
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {cfg.translate.glossary.length === 0 ? (
+                        <tr>
+                          <td
+                            colSpan={4}
+                            className="muted"
+                            style={{ padding: "0.5rem" }}
+                          >
+                            暂无术语。点击「添加术语行」可录入；全部留空不影响任务运行。
+                          </td>
+                        </tr>
+                      ) : null}
+                      {cfg.translate.glossary.map((row, i) => (
+                        <tr key={i}>
+                          <td style={{ padding: "0.25rem" }}>
+                            <input
+                              value={row.source}
+                              onChange={(e) =>
+                                patchGlossary(i, { source: e.target.value })
+                              }
+                            />
+                          </td>
+                          <td style={{ padding: "0.25rem" }}>
+                            <input
+                              value={row.target}
+                              onChange={(e) =>
+                                patchGlossary(i, { target: e.target.value })
+                              }
+                            />
+                          </td>
+                          <td style={{ padding: "0.25rem" }}>
+                            <input
+                              value={row.note}
+                              onChange={(e) =>
+                                patchGlossary(i, { note: e.target.value })
+                              }
+                            />
+                          </td>
+                          <td style={{ padding: "0.25rem" }}>
+                            <button type="button" onClick={() => removeGlossary(i)}>
+                              删除
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          </>
-        )}
+            </>
+          )}
+        </div>
       </section>
 
       <section className="card">
-        <h2>D. 字幕生成</h2>
+        <h2>字幕生成</h2>
         <div className="field-grid">
           <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
             <input
@@ -999,7 +1086,7 @@ export function SettingsPage() {
       </section>
 
       <section className="card">
-        <h2>E. 性能与运行</h2>
+        <h2>性能与运行</h2>
         <div className="field-grid two">
           <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
             <input

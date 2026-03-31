@@ -5,6 +5,7 @@ pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_PAUSE_REQUESTED: &str = "pause_requested";
 pub const STATUS_EXTRACTING: &str = "extracting_audio";
 pub const STATUS_TRANSCRIBING: &str = "transcribing";
+pub const STATUS_SEGMENTING: &str = "segmenting";
 pub const STATUS_TRANSLATING: &str = "translating";
 pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_COMPLETED: &str = "completed";
@@ -29,6 +30,10 @@ pub struct TaskRecord {
     pub subtitle_mode_snapshot: String,
     pub translate_source_lang_snapshot: String,
     pub translate_target_lang_snapshot: String,
+    #[serde(default)]
+    pub segmentation_strategy_snapshot: String,
+    #[serde(default)]
+    pub segmentation_timing_mode_snapshot: String,
     #[serde(default)]
     pub snapshot_id: String,
     #[serde(default)]
@@ -57,6 +62,10 @@ pub struct TaskRecord {
     #[serde(default)]
     pub snapshot_translate_max_segment_chars: u32,
     #[serde(default)]
+    pub snapshot_segmentation_max_chars: u32,
+    #[serde(default)]
+    pub snapshot_segmentation_max_duration_ms: u32,
+    #[serde(default)]
     pub snapshot_llm_base_url: String,
     #[serde(default)]
     pub snapshot_llm_model: String,
@@ -75,6 +84,10 @@ pub struct TaskRecord {
     #[serde(default)]
     pub snapshot_llm_translate_concurrency: u32,
     #[serde(default)]
+    pub snapshot_translator_provider_url: String,
+    #[serde(default)]
+    pub snapshot_translator_use_proxy: bool,
+    #[serde(default)]
     pub snapshot_task_auto_retry_max: u32,
     #[serde(default)]
     pub retry_attempts: u32,
@@ -82,6 +95,8 @@ pub struct TaskRecord {
     pub original_preview: Option<String>,
     #[serde(default)]
     pub translated_preview: Option<String>,
+    #[serde(default)]
+    pub segmentation_note: Option<String>,
     #[serde(default)]
     pub original_output_path: Option<String>,
     #[serde(default)]
@@ -104,7 +119,11 @@ impl TaskRecord {
     pub fn is_active_pipeline(&self) -> bool {
         matches!(
             self.status.as_str(),
-            STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_TRANSLATING | STATUS_PAUSE_REQUESTED
+            STATUS_EXTRACTING
+                | STATUS_TRANSCRIBING
+                | STATUS_SEGMENTING
+                | STATUS_TRANSLATING
+                | STATUS_PAUSE_REQUESTED
         )
     }
 
@@ -118,6 +137,7 @@ impl TaskRecord {
             STATUS_PAUSE_REQUESTED => "暂停请求中".into(),
             STATUS_EXTRACTING => "提取音频中".into(),
             STATUS_TRANSCRIBING => "识别中".into(),
+            STATUS_SEGMENTING => "原字幕分段中".into(),
             STATUS_TRANSLATING => "翻译中".into(),
             STATUS_PAUSED => "已暂停".into(),
             STATUS_COMPLETED => "已完成".into(),
@@ -135,7 +155,7 @@ impl TaskRecord {
         }
         match self.status.as_str() {
             STATUS_PENDING | STATUS_QUEUED => "待开始".into(),
-            STATUS_EXTRACTING | STATUS_TRANSCRIBING => "-".into(),
+            STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_SEGMENTING => "-".into(),
             STATUS_TRANSLATING => "翻译中".into(),
             STATUS_PAUSE_REQUESTED => "暂停请求中".into(),
             STATUS_PAUSED => "已暂停".into(),

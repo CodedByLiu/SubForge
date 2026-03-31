@@ -9,15 +9,20 @@ use crate::app::state::AppRoot;
 use crate::domain::config::{AppConfig, GlossaryEntry};
 use crate::domain::task::{
     TaskStoreFile, STATUS_COMPLETED, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_PAUSE_REQUESTED, STATUS_QUEUED, STATUS_TRANSCRIBING, STATUS_TRANSLATING,
+    STATUS_PAUSE_REQUESTED, STATUS_QUEUED, STATUS_SEGMENTING, STATUS_TRANSCRIBING,
+    STATUS_TRANSLATING,
 };
 use crate::infra::config_store;
 use crate::infra::ffmpeg_tool::{extract_mono_16k_wav, resolve_ffmpeg};
+use crate::infra::google_translate::{
+    build_google_client, translate_all_cues_google, GoogleWebTranslateJob,
+};
 use crate::infra::llm_translate::{translate_all_cues, TranslateJob};
 use crate::infra::paths::temp_dir;
 use crate::infra::runner_limits::{effective_max_parallel_tasks, LlmRequestSlots};
 use crate::infra::secrets;
 use crate::infra::srt::{build_bilingual_cues, format_srt, parse_srt, SubCue};
+use crate::infra::subtitle_segmentation::{segment_cues, SegmentationJob};
 use crate::infra::subtitle_output::{resolve_bilingual_srt_path, resolve_original_srt_path};
 use crate::infra::task_store;
 use crate::infra::whisper_models::model_file_path;
@@ -200,6 +205,7 @@ fn fail_task(
                 "自动重试 {}/{}",
                 t.retry_attempts, retry_limit
             ));
+            t.segmentation_note = None;
             t.error_message = Some(msg.chars().take(4000).collect());
             t.original_preview = None;
             t.translated_preview = None;
@@ -222,6 +228,7 @@ fn fail_task(
         t.status = STATUS_FAILED.into();
         t.cancel_requested = false;
         t.translate_note = None;
+        t.segmentation_note = None;
         t.error_message = Some(msg.chars().take(4000).collect());
         t.phase.clear();
         t.updated_at_ms = now_ms();
@@ -247,6 +254,12 @@ struct JobSnapshot {
     subtitle_mode: String,
     translate_source_lang: String,
     translate_target_lang: String,
+    segmentation_strategy: String,
+    segmentation_timing_mode: String,
+    segmentation_max_chars: u32,
+    segmentation_max_duration_ms: u32,
+    translator_provider_url: String,
+    translator_use_proxy: bool,
     llm_base_url: String,
     llm_model: String,
     llm_timeout_sec: u64,
@@ -326,6 +339,36 @@ fn load_job(
         subtitle_mode: t.subtitle_mode_snapshot.clone(),
         translate_source_lang: t.translate_source_lang_snapshot.clone(),
         translate_target_lang: t.translate_target_lang_snapshot.clone(),
+        segmentation_strategy: if snap && !t.segmentation_strategy_snapshot.is_empty() {
+            t.segmentation_strategy_snapshot.clone()
+        } else {
+            cfg.segmentation.strategy.clone()
+        },
+        segmentation_timing_mode: if snap && !t.segmentation_timing_mode_snapshot.is_empty() {
+            t.segmentation_timing_mode_snapshot.clone()
+        } else {
+            cfg.segmentation.timing_mode.clone()
+        },
+        segmentation_max_chars: if snap && t.snapshot_segmentation_max_chars > 0 {
+            t.snapshot_segmentation_max_chars
+        } else {
+            cfg.segmentation.max_chars_per_segment
+        },
+        segmentation_max_duration_ms: if snap && t.snapshot_segmentation_max_duration_ms > 0 {
+            t.snapshot_segmentation_max_duration_ms
+        } else {
+            (cfg.segmentation.max_duration_seconds.max(0.0) * 1000.0).round() as u32
+        },
+        translator_provider_url: if snap && !t.snapshot_translator_provider_url.trim().is_empty() {
+            t.snapshot_translator_provider_url.clone()
+        } else {
+            cfg.translator.provider_url.clone()
+        },
+        translator_use_proxy: if snap {
+            t.snapshot_translator_use_proxy
+        } else {
+            cfg.translator.use_proxy
+        },
         llm_base_url: if snap && !t.snapshot_llm_base_url.trim().is_empty() {
             t.snapshot_llm_base_url.clone()
         } else {
@@ -430,6 +473,23 @@ fn cache_task_outputs(
             translated_output_path.map(|p| p.to_string_lossy().to_string());
         t.bilingual_output_path =
             bilingual_output_path.map(|p| p.to_string_lossy().to_string());
+        t.updated_at_ms = now_ms();
+        let _ = task_store::save_task_store_file(&root.0, &g);
+    }
+}
+
+fn cache_segmentation_note(
+    ts: &Arc<Mutex<TaskStoreFile>>,
+    root: &AppRoot,
+    id: &str,
+    note: Option<String>,
+) {
+    let mut g = match ts.lock() {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+        t.segmentation_note = note;
         t.updated_at_ms = now_ms();
         let _ = task_store::save_task_store_file(&root.0, &g);
     }
@@ -698,7 +758,7 @@ fn run_one_task(
             return;
         }
     };
-    let cues = match parse_srt(&srt_raw) {
+    let mut cues = match parse_srt(&srt_raw) {
         Ok(c) => c,
         Err(e) => {
             fail_task(app, ts, root, task_id, &e);
@@ -706,6 +766,89 @@ fn run_one_task(
             return;
         }
     };
+
+    let llm_api_key_storage = if job.translator_engine == "llm"
+        || (matches!(job.segmentation_strategy.as_str(), "auto" | "llm_preferred")
+            && !job.llm_base_url.trim().is_empty()
+            && !job.llm_model.trim().is_empty())
+    {
+        match secrets::load_secrets(&root.0) {
+            Ok(s) => s.llm_api_key.trim().to_string(),
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &e.to_string());
+                let _ = fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+    } else {
+        String::new()
+    };
+    if job.segmentation_strategy != "disabled" {
+        {
+            let mut g = match ts.lock() {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
+                t.status = STATUS_SEGMENTING.into();
+                t.progress = if job.will_translate { 45 } else { 70 };
+                t.phase = "segment_subtitles".into();
+                t.updated_at_ms = now_ms();
+                let _ = task_store::save_task_store_file(&root.0, &g);
+            }
+        }
+        emit_progress(
+            app,
+            task_id,
+            STATUS_SEGMENTING,
+            if job.will_translate { 45 } else { 70 },
+            "segment_subtitles",
+        );
+
+        let seg_client = match reqwest::blocking::Client::builder().build() {
+            Ok(c) => c,
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &format!("HTTP 客户端初始化失败: {e}"));
+                let _ = fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        };
+        let seg_job = SegmentationJob {
+            strategy: job.segmentation_strategy.as_str(),
+            timing_mode: job.segmentation_timing_mode.as_str(),
+            max_chars_per_segment: job.segmentation_max_chars,
+            max_duration_ms: job.segmentation_max_duration_ms,
+            llm_base_url: job.llm_base_url.as_str(),
+            llm_model: job.llm_model.as_str(),
+            llm_api_key: llm_api_key_storage.as_str(),
+            llm_timeout_sec: job.llm_timeout_sec,
+        };
+        match segment_cues(&seg_client, &seg_job, &cues, Some(&json_tmp)) {
+            Ok(res) => {
+                cues = res.cues;
+                cache_segmentation_note(ts, root, task_id, res.note);
+            }
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &e);
+                let _ = fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+
+        match mid_run_poll(ts, task_id) {
+            MidRun::Continue => {}
+            MidRun::Pause => {
+                let _ = fs::remove_dir_all(&tmp_root);
+                apply_paused(ts, root, task_id, app);
+                return;
+            }
+            MidRun::Cancel => {
+                let _ = fs::remove_dir_all(&tmp_root);
+                remove_task_if_present(app, ts, root, task_id);
+                return;
+            }
+        }
+    }
 
     let p_tr_done = if job.will_translate { 60u8 } else { 90u8 };
     {
@@ -805,18 +948,7 @@ fn run_one_task(
     }
 
     match job.translator_engine.as_str() {
-        "google_web" => {
-            fail_task(
-                app,
-                ts,
-                root,
-                task_id,
-                "Google Web 实验性翻译尚未接入，请在配置中选择 LLM 翻译",
-            );
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-        "llm" => {}
+        "google_web" | "llm" => {}
         _ => {
             fail_task(
                 app,
@@ -993,15 +1125,7 @@ fn run_one_task(
         }
     }
 
-    let secrets = match secrets::load_secrets(&root.0) {
-        Ok(s) => s,
-        Err(e) => {
-            fail_task(app, ts, root, task_id, &e.to_string());
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    };
-    if secrets.llm_api_key.trim().is_empty() {
+    if job.translator_engine == "llm" && llm_api_key_storage.trim().is_empty() {
         fail_task(
             app,
             ts,
@@ -1021,12 +1145,26 @@ fn run_one_task(
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
             t.status = STATUS_TRANSLATING.into();
             t.progress = 62;
-            t.phase = "translate_llm".into();
+            t.phase = if job.translator_engine == "google_web" {
+                "translate_google".into()
+            } else {
+                "translate_llm".into()
+            };
             t.updated_at_ms = now_ms();
             let _ = task_store::save_task_store_file(&root.0, &g);
         }
     }
-    emit_progress(app, task_id, STATUS_TRANSLATING, 62, "translate_llm");
+    emit_progress(
+        app,
+        task_id,
+        STATUS_TRANSLATING,
+        62,
+        if job.translator_engine == "google_web" {
+            "translate_google"
+        } else {
+            "translate_llm"
+        },
+    );
 
     let client = match reqwest::blocking::Client::builder().build() {
         Ok(c) => c,
@@ -1037,22 +1175,6 @@ fn run_one_task(
         }
     };
 
-    let api_key_storage = secrets.llm_api_key.trim().to_string();
-    let tjob = TranslateJob {
-        base_url: &job.llm_base_url,
-        model: &job.llm_model,
-        api_key: &api_key_storage,
-        timeout_sec: job.llm_timeout_sec.max(5),
-        max_retries_per_batch: job.llm_max_retries,
-        min_interval_ms: job.translator_min_interval_ms,
-        source_lang: job.translate_source_lang.as_str(),
-        target_lang: job.translate_target_lang.as_str(),
-        style: job.translate_style.as_str(),
-        keep_proper_nouns: job.keep_proper_nouns,
-        glossary: &job.glossary,
-        glossary_case_sensitive: job.glossary_case_sensitive,
-    };
-
     let ts_p = ts.clone();
     let tid_p = task_id.to_string();
     let ts_prog = ts.clone();
@@ -1060,30 +1182,83 @@ fn run_one_task(
     let app_prog = app.clone();
     let root_prog = root.0.clone();
 
-    let translate_res = translate_all_cues(
-        &client,
-        &tjob,
-        &cues,
-        job.translate_max_segment_chars,
-        move || translation_should_abort(&ts_p, &tid_p),
-        move |done, total| {
-            let p = if total == 0 {
-                62u8
-            } else {
-                (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
-            };
-            if let Ok(mut g) = ts_prog.lock() {
-                if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
-                    tt.progress = p;
-                    tt.updated_at_ms = now_ms();
-                    let _ = task_store::save_task_store_file(&root_prog, &g);
+    let translate_res = if job.translator_engine == "llm" {
+        let tjob = TranslateJob {
+            base_url: &job.llm_base_url,
+            model: &job.llm_model,
+            api_key: &llm_api_key_storage,
+            timeout_sec: job.llm_timeout_sec.max(5),
+            max_retries_per_batch: job.llm_max_retries,
+            min_interval_ms: job.translator_min_interval_ms,
+            source_lang: job.translate_source_lang.as_str(),
+            target_lang: job.translate_target_lang.as_str(),
+            style: job.translate_style.as_str(),
+            keep_proper_nouns: job.keep_proper_nouns,
+            glossary: &job.glossary,
+            glossary_case_sensitive: job.glossary_case_sensitive,
+        };
+        translate_all_cues(
+            &client,
+            &tjob,
+            &cues,
+            job.translate_max_segment_chars,
+            move || translation_should_abort(&ts_p, &tid_p),
+            move |done, total| {
+                let p = if total == 0 {
+                    62u8
+                } else {
+                    (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
+                };
+                if let Ok(mut g) = ts_prog.lock() {
+                    if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
+                        tt.progress = p;
+                        tt.updated_at_ms = now_ms();
+                        let _ = task_store::save_task_store_file(&root_prog, &g);
+                    }
                 }
+                emit_progress(&app_prog, &tid_prog, STATUS_TRANSLATING, p, "translate_llm");
+            },
+            Some(llm_slots),
+            job.translate_concurrency,
+        )
+    } else {
+        let google_client = match build_google_client(job.translator_use_proxy) {
+            Ok(c) => c,
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &e);
+                let _ = fs::remove_dir_all(&tmp_root);
+                return;
             }
-            emit_progress(&app_prog, &tid_prog, STATUS_TRANSLATING, p, "translate_llm");
-        },
-        Some(llm_slots),
-        job.translate_concurrency,
-    );
+        };
+        let gjob = GoogleWebTranslateJob {
+            provider_url: job.translator_provider_url.as_str(),
+            min_interval_ms: job.translator_min_interval_ms,
+            source_lang: job.translate_source_lang.as_str(),
+            target_lang: job.translate_target_lang.as_str(),
+        };
+        translate_all_cues_google(
+            &google_client,
+            &gjob,
+            &cues,
+            move || translation_should_abort(&ts_p, &tid_p),
+            move |done, total| {
+                let p = if total == 0 {
+                    62u8
+                } else {
+                    (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
+                };
+                if let Ok(mut g) = ts_prog.lock() {
+                    if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
+                        tt.progress = p;
+                        tt.updated_at_ms = now_ms();
+                        let _ = task_store::save_task_store_file(&root_prog, &g);
+                    }
+                }
+                emit_progress(&app_prog, &tid_prog, STATUS_TRANSLATING, p, "translate_google");
+            },
+        )
+        .map(|translated| (translated, false))
+    };
 
     match translate_res {
         Ok((translated, any_fb)) => {

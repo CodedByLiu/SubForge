@@ -60,6 +60,18 @@ fn merge_config_defaults(cfg: &mut AppConfig) {
     if cfg.translate.max_segment_chars == 0 {
         cfg.translate.max_segment_chars = d.translate.max_segment_chars;
     }
+    if cfg.segmentation.strategy.is_empty() {
+        cfg.segmentation.strategy = d.segmentation.strategy;
+    }
+    if cfg.segmentation.max_chars_per_segment == 0 {
+        cfg.segmentation.max_chars_per_segment = d.segmentation.max_chars_per_segment;
+    }
+    if cfg.segmentation.max_duration_seconds <= 0.0 {
+        cfg.segmentation.max_duration_seconds = d.segmentation.max_duration_seconds;
+    }
+    if cfg.segmentation.timing_mode.is_empty() {
+        cfg.segmentation.timing_mode = d.segmentation.timing_mode;
+    }
     if cfg.subtitle.mode.is_empty() {
         cfg.subtitle.mode = d.subtitle.mode;
     }

@@ -90,6 +90,8 @@ pub fn save_config(
                 task.subtitle_mode_snapshot = cfg.subtitle.mode.clone();
                 task.translate_source_lang_snapshot = cfg.translate.source_lang.clone();
                 task.translate_target_lang_snapshot = cfg.translate.target_lang.clone();
+                task.segmentation_strategy_snapshot = cfg.segmentation.strategy.clone();
+                task.segmentation_timing_mode_snapshot = cfg.segmentation.timing_mode.clone();
                 task.updated_at_ms = tnow;
             }
         }

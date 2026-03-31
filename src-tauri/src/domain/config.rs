@@ -7,6 +7,8 @@ pub struct AppConfig {
     pub translator: TranslatorConfig,
     pub whisper: WhisperConfig,
     pub translate: TranslateConfig,
+    #[serde(default)]
+    pub segmentation: SegmentationConfig,
     pub subtitle: SubtitleConfig,
     pub runtime: RuntimeConfig,
 }
@@ -70,6 +72,25 @@ pub struct TranslateConfig {
     pub glossary_case_sensitive: bool,
     #[serde(default)]
     pub glossary: Vec<GlossaryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentationConfig {
+    pub strategy: String,
+    pub max_chars_per_segment: u32,
+    pub max_duration_seconds: f64,
+    pub timing_mode: String,
+}
+
+impl Default for SegmentationConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "auto".into(),
+            max_chars_per_segment: 42,
+            max_duration_seconds: 6.0,
+            timing_mode: "word_timestamps_first".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +193,7 @@ impl Default for AppConfig {
                 glossary_case_sensitive: false,
                 glossary: Vec::new(),
             },
+            segmentation: SegmentationConfig::default(),
             subtitle: SubtitleConfig {
                 mode: "bilingual_single".into(),
                 format: "srt".into(),
@@ -203,6 +225,16 @@ impl AppConfig {
         if self.translate.max_segment_chars < 64 || self.translate.max_segment_chars > 32000 {
             return Err("每段最大字符数需在合理范围内".into());
         }
+        if self.segmentation.max_chars_per_segment < 8
+            || self.segmentation.max_chars_per_segment > 500
+        {
+            return Err("原字幕单条最大字符数需在 8–500 之间".into());
+        }
+        if self.segmentation.max_duration_seconds <= 0.5
+            || self.segmentation.max_duration_seconds > 60.0
+        {
+            return Err("原字幕单条最大持续时长需在 0.5–60 秒之间".into());
+        }
         if self.runtime.max_parallel_tasks == 0 || self.runtime.max_parallel_tasks > 16 {
             return Err("最大并发任务数需在 1–16 之间".into());
         }
@@ -215,6 +247,14 @@ impl AppConfig {
         let engine = self.translator.engine.as_str();
         if !matches!(engine, "none" | "llm" | "google_web") {
             return Err("翻译引擎类型无效".into());
+        }
+        let seg = self.segmentation.strategy.as_str();
+        if !matches!(seg, "disabled" | "auto" | "rules_only" | "llm_preferred") {
+            return Err("原字幕分段策略无效".into());
+        }
+        let timing = self.segmentation.timing_mode.as_str();
+        if !matches!(timing, "word_timestamps_first" | "approximate_reflow") {
+            return Err("分段时间策略无效".into());
         }
         let mode = self.subtitle.mode.as_str();
         if !matches!(
@@ -236,6 +276,10 @@ impl AppConfig {
     /// §6.2：是否执行翻译（字幕模式非「仅原文」且引擎非关闭）
     pub fn will_run_translation(&self) -> bool {
         self.subtitle.mode != "original_only" && self.translator.engine != "none"
+    }
+
+    pub fn has_llm_endpoint_config(&self) -> bool {
+        !self.llm.base_url.trim().is_empty() && !self.llm.model.trim().is_empty()
     }
 }
 

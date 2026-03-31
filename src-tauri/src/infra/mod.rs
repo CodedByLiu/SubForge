@@ -1,5 +1,6 @@
 pub mod config_store;
 pub mod ffmpeg_tool;
+pub mod google_translate;
 pub mod hardware;
 pub mod layout;
 pub mod llm_translate;
@@ -9,6 +10,7 @@ pub mod runner_limits;
 pub mod secrets;
 pub mod srt;
 pub mod subtitle_output;
+pub mod subtitle_segmentation;
 pub mod task_store;
 pub mod transcribe_deps;
 pub mod whisper_models;

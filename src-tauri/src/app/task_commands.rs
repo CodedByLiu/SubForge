@@ -8,10 +8,12 @@ use uuid::Uuid;
 
 use crate::domain::config::AppConfig;
 use crate::domain::task::{
-    TaskRecord, TaskStoreFile, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSE_REQUESTED, STATUS_PAUSED,
-    STATUS_PENDING, STATUS_QUEUED, STATUS_TRANSLATING, STATUS_TRANSCRIBING,
+    TaskRecord, TaskStoreFile, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSE_REQUESTED,
+    STATUS_PAUSED, STATUS_PENDING, STATUS_QUEUED, STATUS_SEGMENTING, STATUS_TRANSLATING,
+    STATUS_TRANSCRIBING,
 };
 use crate::infra::config_store;
+use crate::infra::secrets;
 use crate::infra::task_store::{self, normalize_existing_path, video_extension_ok};
 
 use super::state::{AppRoot, TaskState};
@@ -38,9 +40,10 @@ fn build_snapshot_summary(cfg: &AppConfig, output_dir_mode: &str) -> String {
         "视频同目录"
     };
     format!(
-        "mode={} translator={} whisper={} gpu={} src={} tgt={} output={}",
+        "mode={} translator={} segment={} whisper={} gpu={} src={} tgt={} output={}",
         cfg.subtitle.mode,
         cfg.translator.engine,
+        cfg.segmentation.strategy,
         cfg.whisper.model,
         if cfg.whisper.use_gpu { "on" } else { "off" },
         cfg.translate.source_lang,
@@ -55,10 +58,13 @@ fn apply_pending_config_defaults(task: &mut TaskRecord, cfg: &AppConfig) {
     task.subtitle_mode_snapshot = cfg.subtitle.mode.clone();
     task.translate_source_lang_snapshot = cfg.translate.source_lang.clone();
     task.translate_target_lang_snapshot = cfg.translate.target_lang.clone();
+    task.segmentation_strategy_snapshot = cfg.segmentation.strategy.clone();
+    task.segmentation_timing_mode_snapshot = cfg.segmentation.timing_mode.clone();
 }
 
 fn clear_run_artifacts(task: &mut TaskRecord) {
     task.translate_note = None;
+    task.segmentation_note = None;
     task.error_message = None;
     task.cancel_requested = false;
     task.original_preview = None;
@@ -70,6 +76,19 @@ fn clear_run_artifacts(task: &mut TaskRecord) {
 
 fn has_snapshot(task: &TaskRecord) -> bool {
     !task.snapshot_id.trim().is_empty()
+}
+
+fn validate_prestart_requirements(root: &AppRoot, cfg: &AppConfig) -> Result<(), String> {
+    if cfg.segmentation.strategy == "llm_preferred" {
+        if !cfg.has_llm_endpoint_config() {
+            return Err("当前为「LLM 优先」原字幕分段，但未配置可用的 LLM Base URL / 模型".into());
+        }
+        let secret_payload = secrets::load_secrets(&root.0).map_err(|e| e.to_string())?;
+        if secret_payload.llm_api_key.trim().is_empty() {
+            return Err("当前为「LLM 优先」原字幕分段，但未保存 LLM API Key".into());
+        }
+    }
+    Ok(())
 }
 
 fn prepare_for_queue(task: &mut TaskRecord, tnow: i64) {
@@ -108,6 +127,11 @@ fn apply_run_snapshot(
     task.snapshot_cpu_thread_limit = cfg.runtime.cpu_thread_limit;
     task.snapshot_translate_style = cfg.translate.style.clone();
     task.snapshot_translate_max_segment_chars = cfg.translate.max_segment_chars;
+    task.snapshot_segmentation_max_chars = cfg.segmentation.max_chars_per_segment;
+    task.snapshot_segmentation_max_duration_ms =
+        (cfg.segmentation.max_duration_seconds.max(0.0) * 1000.0).round() as u32;
+    task.segmentation_strategy_snapshot = cfg.segmentation.strategy.clone();
+    task.segmentation_timing_mode_snapshot = cfg.segmentation.timing_mode.clone();
     task.snapshot_llm_base_url = cfg.llm.base_url.clone();
     task.snapshot_llm_model = cfg.llm.model.clone();
     task.snapshot_llm_timeout_sec = cfg.llm.timeout_sec;
@@ -118,6 +142,8 @@ fn apply_run_snapshot(
         serde_json::to_string(&cfg.translate.glossary).unwrap_or_else(|_| "[]".into());
     task.snapshot_translator_min_interval_ms = cfg.translator.min_request_interval_ms;
     task.snapshot_llm_translate_concurrency = cfg.llm.translate_concurrency;
+    task.snapshot_translator_provider_url = cfg.translator.provider_url.clone();
+    task.snapshot_translator_use_proxy = cfg.translator.use_proxy;
     task.snapshot_task_auto_retry_max = cfg.runtime.task_auto_retry_max;
     task.retry_attempts = 0;
     clear_run_artifacts(task);
@@ -202,6 +228,7 @@ pub fn list_tasks(ts: State<'_, TaskState>) -> Result<TaskListPanel, String> {
             STATUS_QUEUED
                 | STATUS_EXTRACTING
                 | STATUS_TRANSCRIBING
+                | STATUS_SEGMENTING
                 | STATUS_TRANSLATING
                 | STATUS_PAUSE_REQUESTED
         )
@@ -312,6 +339,8 @@ pub fn import_videos(
             subtitle_mode_snapshot: String::new(),
             translate_source_lang_snapshot: String::new(),
             translate_target_lang_snapshot: String::new(),
+            segmentation_strategy_snapshot: String::new(),
+            segmentation_timing_mode_snapshot: String::new(),
             snapshot_id: String::new(),
             snapshot_summary: String::new(),
             snapshot_whisper_model: String::new(),
@@ -325,6 +354,8 @@ pub fn import_videos(
             snapshot_cpu_thread_limit: 0,
             snapshot_translate_style: String::new(),
             snapshot_translate_max_segment_chars: 0,
+            snapshot_segmentation_max_chars: 0,
+            snapshot_segmentation_max_duration_ms: 0,
             snapshot_llm_base_url: String::new(),
             snapshot_llm_model: String::new(),
             snapshot_llm_timeout_sec: 0,
@@ -334,10 +365,13 @@ pub fn import_videos(
             snapshot_translate_glossary_json: String::new(),
             snapshot_translator_min_interval_ms: 0,
             snapshot_llm_translate_concurrency: 0,
+            snapshot_translator_provider_url: String::new(),
+            snapshot_translator_use_proxy: false,
             snapshot_task_auto_retry_max: 0,
             retry_attempts: 0,
             original_preview: None,
             translated_preview: None,
+            segmentation_note: None,
             original_output_path: None,
             translated_output_path: None,
             bilingual_output_path: None,
@@ -421,6 +455,7 @@ pub fn start_task(root: State<'_, AppRoot>, ts: State<'_, TaskState>, id: String
     let tnow = now_ms();
     match t.status.as_str() {
         STATUS_PENDING => {
+            validate_prestart_requirements(&root, &cfg)?;
             apply_run_snapshot(t, &cfg, &od_mode, &od_custom);
             prepare_for_queue(t, tnow);
         }
@@ -428,6 +463,7 @@ pub fn start_task(root: State<'_, AppRoot>, ts: State<'_, TaskState>, id: String
             resume_with_existing_snapshot(t, tnow);
         }
         STATUS_PAUSED | STATUS_FAILED => {
+            validate_prestart_requirements(&root, &cfg)?;
             apply_run_snapshot(t, &cfg, &od_mode, &od_custom);
             prepare_for_queue(t, tnow);
         }
@@ -448,6 +484,7 @@ pub fn start_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result
         if eligible_for_start(&t.status) {
             match t.status.as_str() {
                 STATUS_PENDING => {
+                    validate_prestart_requirements(&root, &cfg)?;
                     apply_run_snapshot(t, &cfg, &od_mode, &od_custom);
                     prepare_for_queue(t, tnow);
                 }
@@ -455,6 +492,7 @@ pub fn start_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result
                     resume_with_existing_snapshot(t, tnow);
                 }
                 STATUS_PAUSED | STATUS_FAILED => {
+                    validate_prestart_requirements(&root, &cfg)?;
                     apply_run_snapshot(t, &cfg, &od_mode, &od_custom);
                     prepare_for_queue(t, tnow);
                 }
@@ -480,7 +518,7 @@ pub fn pause_task(root: State<'_, AppRoot>, ts: State<'_, TaskState>, id: String
             t.status = STATUS_PAUSED.into();
             t.updated_at_ms = now_ms();
         }
-        STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_TRANSLATING => {
+        STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_SEGMENTING | STATUS_TRANSLATING => {
             t.status = STATUS_PAUSE_REQUESTED.into();
             t.updated_at_ms = now_ms();
         }
@@ -499,7 +537,7 @@ pub fn pause_all_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Re
                 t.status = STATUS_PAUSED.into();
                 t.updated_at_ms = tnow;
             }
-            STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_TRANSLATING => {
+            STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_SEGMENTING | STATUS_TRANSLATING => {
                 t.status = STATUS_PAUSE_REQUESTED.into();
                 t.updated_at_ms = tnow;
             }

@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -162,16 +162,22 @@ export function MainPage() {
     if (!panel || panel.tasks.length === 0) return;
     let force = false;
     if (panel.has_active_pipeline) {
-      if (
-        !window.confirm(
-          "存在执行中的任务（提取/识别/翻译），确定要清空列表吗？",
-        )
-      ) {
+      const ok = await confirm("存在执行中的任务（提取/识别/翻译），确定要清空列表吗？", {
+        title: "SubForge",
+        kind: "warning",
+      });
+      if (!ok) {
         return;
       }
       force = true;
-    } else if (!window.confirm("确定清空当前任务列表？")) {
-      return;
+    } else {
+      const ok = await confirm("确定清空当前任务列表？", {
+        title: "SubForge",
+        kind: "warning",
+      });
+      if (!ok) {
+        return;
+      }
     }
     setBusy(true);
     try {
@@ -387,12 +393,18 @@ export function MainPage() {
                       type="button"
                       disabled={busy}
                       onClick={() => {
+                        void (async () => {
                         const active = pipelineActiveStatus(t.status);
                         const msg = active
                           ? `任务「${t.file_name}」正在执行或排队中，删除将请求安全取消并从列表移除，确定？`
                           : `删除任务「${t.file_name}」？`;
-                        if (!window.confirm(msg)) return;
+                        const ok = await confirm(msg, {
+                          title: "SubForge",
+                          kind: "warning",
+                        });
+                        if (!ok) return;
                         void run(() => deleteTask(t.id));
+                        })();
                       }}
                     >
                       删除

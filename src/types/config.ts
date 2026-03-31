@@ -41,6 +41,13 @@ export interface TranslateConfig {
   glossary: GlossaryEntry[];
 }
 
+export interface SegmentationConfig {
+  strategy: string;
+  max_chars_per_segment: number;
+  max_duration_seconds: number;
+  timing_mode: string;
+}
+
 export interface SubtitleConfig {
   mode: string;
   format: string;
@@ -61,6 +68,7 @@ export interface AppConfig {
   translator: TranslatorConfig;
   whisper: WhisperConfig;
   translate: TranslateConfig;
+  segmentation: SegmentationConfig;
   subtitle: SubtitleConfig;
   runtime: RuntimeConfig;
 }
@@ -115,6 +123,12 @@ export function defaultAppConfig(): AppConfig {
       keep_proper_nouns_in_source: true,
       glossary_case_sensitive: false,
       glossary: [],
+    },
+    segmentation: {
+      strategy: "auto",
+      max_chars_per_segment: 42,
+      max_duration_seconds: 6,
+      timing_mode: "word_timestamps_first",
     },
     subtitle: {
       mode: "bilingual_single",

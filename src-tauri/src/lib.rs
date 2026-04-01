@@ -11,6 +11,26 @@ use infra::layout;
 use infra::runner_limits::LlmRequestSlots;
 use tauri::Manager;
 
+#[cfg(not(mobile))]
+fn apply_window_icon(app: &tauri::App) {
+    use tauri::image::Image;
+    let icon = match Image::from_bytes(include_bytes!("../icons/128x128.png")) {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("解析窗口图标失败: {e}");
+            return;
+        }
+    };
+    if let Some(w) = app.get_webview_window("main") {
+        if let Err(e) = w.set_icon(icon) {
+            log::warn!("设置窗口图标失败: {e}");
+        }
+    }
+}
+
+#[cfg(mobile)]
+fn apply_window_icon(_app: &tauri::App) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -56,6 +76,7 @@ pub fn run() {
             app.manage(AppRoot(app_dir));
             app.manage(task_state);
             app.manage(WhisperDownloadLock::default());
+            apply_window_icon(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

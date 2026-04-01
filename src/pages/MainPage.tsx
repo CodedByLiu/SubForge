@@ -223,7 +223,12 @@ export function MainPage() {
     <div className="main-page">
       <header className="main-toolbar">
         <div className="main-toolbar-row">
-          <h1 className="title">SubForge</h1>
+          <h1 className="title title-with-logo">
+            <img className="app-logo" src="/logo-1.png" alt="" width={36} height={36} />
+            <span className="title-wordmark">
+              <span className="title-sub">Sub</span><span className="title-forge">Forge</span>
+            </span>
+          </h1>
           <Link className="link-btn" to="/settings">
             配置
           </Link>

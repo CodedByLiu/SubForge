@@ -449,7 +449,7 @@ export function SettingsPage() {
               padding: "0.65rem 0.75rem",
               borderRadius: 8,
               border: "1px solid var(--border)",
-              background: "#0c0f14",
+              background: "var(--input-bg)",
               fontSize: "0.85rem",
             }}
           >
@@ -674,13 +674,13 @@ export function SettingsPage() {
                   }}
                 >
                   <div
+                    className="progress-bar-fill"
                     style={{
                       height: "100%",
                       width: `${Math.max(
                         4,
                         Math.min(100, runtimeProgress.percent),
                       )}%`,
-                      background: "var(--accent)",
                       transition: "width 0.2s",
                     }}
                   />
@@ -803,10 +803,10 @@ export function SettingsPage() {
                   }}
                 >
                   <div
+                    className="progress-bar-fill"
                     style={{
                       height: "100%",
                       width: `${dlProgress.percent}%`,
-                      background: "var(--accent)",
                       transition: "width 0.2s",
                     }}
                   />

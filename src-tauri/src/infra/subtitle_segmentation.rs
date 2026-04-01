@@ -7,11 +7,34 @@ use serde_json::{json, Value};
 use super::openai_compat::chat_completions_url;
 use super::srt::SubCue;
 
+const MIN_SEGMENT_DURATION_MS: i64 = 800;
+const MIN_SEGMENT_VISIBLE_CHARS: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TimeUnit {
     start_ms: i64,
     end_ms: i64,
     text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Word,
+    Space,
+    Punct,
+}
+
+#[derive(Debug, Clone)]
+struct TokenSpan {
+    start_char: usize,
+    kind: TokenKind,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoundaryPoint {
+    char_pos: usize,
+    strong: bool,
 }
 
 pub struct SegmentationJob<'a> {
@@ -51,7 +74,6 @@ pub fn segment_cues(
         Vec::new()
     };
 
-    let mut next_index = 1u32;
     let mut out = Vec::new();
     let mut notes = Vec::<String>::new();
 
@@ -62,41 +84,41 @@ pub fn segment_cues(
             job.max_duration_ms.max(1) as i64,
         );
         let parts = if should_split {
-            match split_text_parts(client, job, cue) {
-                Ok(parts) => {
-                    parts
-                }
-                Err(e) => return Err(e),
-            }
+            split_text_parts(client, job, cue)?
         } else {
-            vec![cue.text.clone()]
+            vec![normalize_part_text(&cue.text)]
         };
 
         let segmented = if parts.len() <= 1 {
             vec![SubCue {
-                index: next_index,
+                index: 0,
                 start_ms: cue.start_ms,
                 end_ms: cue.end_ms,
-                text: cue.text.clone(),
+                text: normalize_part_text(&cue.text),
             }]
-        } else if let Some(cues_with_time) =
-            apply_word_timing(cue, &parts, &timing_units, &mut next_index)
-        {
+        } else if let Some(cues_with_time) = apply_word_timing(cue, &parts, &timing_units) {
             cues_with_time
         } else {
             if job.timing_mode == "word_timestamps_first" {
-                notes.push("分段时间已降级为近似对齐".into());
+                notes.push("Subtitle timing fell back to approximate reflow.".into());
             }
-            apply_approximate_timing(cue, &parts, &mut next_index)
+            apply_approximate_timing(cue, &parts)
         };
 
-        out.extend(segmented);
+        out.extend(merge_short_cues(segmented));
     }
 
+    renumber_cues(&mut out);
     Ok(SegmentationResult {
         cues: out,
         note: dedupe_notes(notes),
     })
+}
+
+fn renumber_cues(cues: &mut [SubCue]) {
+    for (idx, cue) in cues.iter_mut().enumerate() {
+        cue.index = (idx + 1) as u32;
+    }
 }
 
 fn dedupe_notes(notes: Vec<String>) -> Option<String> {
@@ -106,15 +128,11 @@ fn dedupe_notes(notes: Vec<String>) -> Option<String> {
             uniq.push(note);
         }
     }
-    (!uniq.is_empty()).then(|| uniq.join("；"))
+    (!uniq.is_empty()).then(|| uniq.join(", "))
 }
 
 fn cue_should_split(cue: &SubCue, max_chars: u32, max_duration_ms: i64) -> bool {
-    let char_count = cue
-        .text
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .count() as u32;
+    let char_count = cue.text.chars().filter(|ch| !ch.is_control()).count() as u32;
     let duration = (cue.end_ms - cue.start_ms).max(0);
     char_count > max_chars || duration > max_duration_ms
 }
@@ -134,15 +152,16 @@ fn split_text_parts(
                 match split_by_llm(client, job, cue) {
                     Ok(parts) => Ok(parts),
                     Err(e) => {
-                        let mut fallback = split_by_rules(
+                        let fallback = split_by_rules(
                             &cue.text,
                             desired_parts(cue, job.max_chars_per_segment, job.max_duration_ms),
                         );
-                        if fallback.is_empty() {
-                            fallback.push(cue.text.clone());
-                        }
-                        log::warn!("LLM 分段失败，回退规则分段: {e}");
-                        Ok(fallback)
+                        log::warn!("LLM subtitle segmentation failed, fallback to rules: {e}");
+                        Ok(if fallback.is_empty() {
+                            vec![normalize_part_text(&cue.text)]
+                        } else {
+                            fallback
+                        })
                     }
                 }
             } else if job.strategy == "auto" {
@@ -151,10 +170,10 @@ fn split_text_parts(
                     desired_parts(cue, job.max_chars_per_segment, job.max_duration_ms),
                 ))
             } else {
-                Err("未配置可用 LLM，无法执行 LLM 优先分段".into())
+                Err("LLM-preferred segmentation requested but no usable LLM configuration is available.".into())
             }
         }
-        _ => Ok(vec![cue.text.clone()]),
+        _ => Ok(vec![normalize_part_text(&cue.text)]),
     }
 }
 
@@ -169,79 +188,223 @@ fn desired_parts(cue: &SubCue, max_chars: u32, max_duration_ms: u32) -> usize {
     let duration_ms = (cue.end_ms - cue.start_ms).max(1) as usize;
     let by_chars = chars.div_ceil(max_chars.max(1) as usize);
     let by_duration = duration_ms.div_ceil(max_duration_ms.max(1) as usize);
-    by_chars.max(by_duration).max(1)
+    let base = by_chars.max(by_duration).max(1);
+    let max_by_duration = (duration_ms / MIN_SEGMENT_DURATION_MS as usize).max(1);
+    base.min(max_by_duration.max(1))
 }
 
 fn split_by_rules(text: &str, desired_parts: usize) -> Vec<String> {
+    if desired_parts <= 1 {
+        return vec![normalize_part_text(text)];
+    }
     let char_count = text.chars().count();
-    if desired_parts <= 1 || char_count < 2 {
-        return vec![text.to_string()];
+    if char_count < 2 {
+        return vec![normalize_part_text(text)];
     }
-    let chars: Vec<char> = text.chars().collect();
+
+    let boundaries = build_boundaries(text);
+    if boundaries.is_empty() {
+        return vec![normalize_part_text(text)];
+    }
+
     let mut cuts = Vec::<usize>::new();
-    for part_idx in 1..desired_parts {
-        let target = char_count * part_idx / desired_parts;
-        let cut = find_cut_near(&chars, target, &cuts);
-        if cut > 0 && cut < char_count && cuts.last().copied() != Some(cut) {
-            cuts.push(cut);
-        }
-    }
-    cuts.sort_unstable();
-    split_by_char_positions(text, &cuts)
-}
+    let mut after = 0usize;
+    let cuts_needed = desired_parts.saturating_sub(1);
 
-fn find_cut_near(chars: &[char], target: usize, existing: &[usize]) -> usize {
-    let min_bound = existing.last().copied().unwrap_or(0) + 1;
-    let max_bound = chars.len().saturating_sub(1);
-    if min_bound >= max_bound {
-        return target.clamp(min_bound, max_bound);
-    }
-
-    let scan_radius = (chars.len() / 8).max(6);
-    let start = target.saturating_sub(scan_radius).max(min_bound);
-    let end = (target + scan_radius).min(max_bound);
-    let mut best = None::<(usize, usize)>;
-
-    for i in start..=end {
-        let prev = chars[i - 1];
-        let curr = chars[i];
-        let strong = is_strong_boundary(prev, curr);
-        let soft = strong || is_soft_boundary(prev, curr);
-        if soft {
-            let dist = i.abs_diff(target);
-            let score = if strong { dist } else { dist + 4 };
-            if best.map(|(_, s)| score < s).unwrap_or(true) {
-                best = Some((i, score));
+    for part_idx in 0..cuts_needed {
+        let target = char_count * (part_idx + 1) / desired_parts;
+        let reserve_tail = cuts_needed - part_idx - 1;
+        if let Some(cut) = choose_boundary(&boundaries, after, target, reserve_tail) {
+            if cut > after && cut < char_count {
+                cuts.push(cut);
+                after = cut;
             }
         }
     }
 
-    best.map(|(i, _)| i)
-        .unwrap_or_else(|| target.clamp(min_bound, max_bound))
+    let parts = split_by_safe_positions(text, &cuts);
+    if parts.len() <= 1 {
+        vec![normalize_part_text(text)]
+    } else {
+        parts
+    }
 }
 
-fn is_strong_boundary(prev: char, curr: char) -> bool {
-    matches!(prev, '，' | '。' | '！' | '？' | '；' | ',' | '.' | '!' | '?' | ';' | ':' | '：')
-        || (prev == '\n' || curr == '\n')
+fn choose_boundary(
+    boundaries: &[BoundaryPoint],
+    after_char: usize,
+    target: usize,
+    reserve_tail: usize,
+) -> Option<usize> {
+    let start_idx = boundaries.partition_point(|b| b.char_pos <= after_char);
+    let end_exclusive = boundaries.len().saturating_sub(reserve_tail);
+    if start_idx >= end_exclusive {
+        return None;
+    }
+
+    let mut best = None::<(usize, usize)>;
+    for boundary in &boundaries[start_idx..end_exclusive] {
+        let dist = boundary.char_pos.abs_diff(target);
+        let penalty = if boundary.strong { 0 } else { 8 };
+        let score = dist.saturating_mul(4).saturating_add(penalty);
+        if best.map(|(_, s)| score < s).unwrap_or(true) {
+            best = Some((boundary.char_pos, score));
+        }
+    }
+    best.map(|(pos, _)| pos)
 }
 
-fn is_soft_boundary(prev: char, curr: char) -> bool {
-    prev.is_whitespace() || curr.is_whitespace()
+fn build_boundaries(text: &str) -> Vec<BoundaryPoint> {
+    let tokens = tokenize_text(text);
+    if tokens.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::<BoundaryPoint>::new();
+    for idx in 1..tokens.len() {
+        let prev = &tokens[idx - 1];
+        let next = &tokens[idx];
+        if !can_split_between(prev, next) {
+            continue;
+        }
+        let strong = boundary_is_strong(&tokens, idx);
+        if out
+            .last()
+            .map(|b| b.char_pos == next.start_char)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        out.push(BoundaryPoint {
+            char_pos: next.start_char,
+            strong,
+        });
+    }
+    out
 }
 
-fn split_by_char_positions(text: &str, cuts: &[usize]) -> Vec<String> {
+fn can_split_between(prev: &TokenSpan, next: &TokenSpan) -> bool {
+    matches!(prev.kind, TokenKind::Space | TokenKind::Punct)
+        || matches!(next.kind, TokenKind::Space)
+}
+
+fn boundary_is_strong(tokens: &[TokenSpan], idx: usize) -> bool {
+    let prev = &tokens[idx - 1];
+    if prev.text.contains('\n') {
+        return true;
+    }
+    if token_has_pause_punct(&prev.text) {
+        return true;
+    }
+    if matches!(prev.kind, TokenKind::Space) && idx >= 2 {
+        return token_has_pause_punct(&tokens[idx - 2].text);
+    }
+    false
+}
+
+fn token_has_pause_punct(text: &str) -> bool {
+    text.chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .map(is_pause_punct)
+        .unwrap_or(false)
+}
+
+fn is_pause_punct(ch: char) -> bool {
+    matches!(ch, ',' | '.' | '!' | '?' | ';' | ':')
+}
+
+fn tokenize_text(text: &str) -> Vec<TokenSpan> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::<TokenSpan>::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let start = i;
+        let ch = chars[i];
+
+        if ch.is_whitespace() {
+            i += 1;
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            tokens.push(TokenSpan {
+                start_char: start,
+                kind: TokenKind::Space,
+                text: chars[start..i].iter().collect(),
+            });
+            continue;
+        }
+
+        if is_word_core(ch) {
+            i += 1;
+            while i < chars.len() {
+                if is_word_core(chars[i]) || is_word_connector_at(&chars, i) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            tokens.push(TokenSpan {
+                start_char: start,
+                kind: TokenKind::Word,
+                text: chars[start..i].iter().collect(),
+            });
+            continue;
+        }
+
+        i += 1;
+        tokens.push(TokenSpan {
+            start_char: start,
+            kind: TokenKind::Punct,
+            text: chars[start..i].iter().collect(),
+        });
+    }
+
+    tokens
+}
+
+fn is_word_core(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn is_word_connector_at(chars: &[char], idx: usize) -> bool {
+    let Some(&curr) = chars.get(idx) else {
+        return false;
+    };
+    if !matches!(curr, '\'' | '’' | '-' | '.' | '_') {
+        return false;
+    }
+    let Some(prev) = idx.checked_sub(1).and_then(|i| chars.get(i)) else {
+        return false;
+    };
+    let Some(next) = chars.get(idx + 1) else {
+        return false;
+    };
+    is_word_core(*prev) && is_word_core(*next)
+}
+
+fn split_by_safe_positions(text: &str, cuts: &[usize]) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut start = 0usize;
+
     for &cut in cuts {
         if cut <= start || cut >= chars.len() {
             continue;
         }
-        out.push(chars[start..cut].iter().collect::<String>());
+        let part = normalize_part_text(&chars[start..cut].iter().collect::<String>());
+        if !part.is_empty() {
+            out.push(part);
+        }
         start = cut;
     }
-    out.push(chars[start..].iter().collect::<String>());
-    out.into_iter().filter(|s| !s.is_empty()).collect()
+
+    let tail = normalize_part_text(&chars[start..].iter().collect::<String>());
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
 }
 
 fn split_by_llm(
@@ -251,69 +414,106 @@ fn split_by_llm(
 ) -> Result<Vec<String>, String> {
     let char_len = cue.text.chars().count();
     if char_len < 2 {
-        return Ok(vec![cue.text.clone()]);
+        return Ok(vec![normalize_part_text(&cue.text)]);
     }
+
     let desired = desired_parts(cue, job.max_chars_per_segment, job.max_duration_ms);
-    let sys = "你是字幕断句助手。你的任务是仅返回断句切分位置，不改写任何文本，不解释。";
-    let user = format!(
-        "给定一段字幕文本，请返回 JSON 数组，元素为从 0 开始的 Unicode 字符切分位置索引。\n\
-要求：\n\
-1. 只在自然语义边界切分。\n\
-2. 不要返回 0，也不要返回总长度 {char_len}。\n\
-3. 目标切成 {desired} 段左右；若原句无需强切，可返回更少切点。\n\
-4. 输出只能是 JSON 数组，例如 [12, 24]。\n\
-5. 不得改写原文。\n\
-原文：\n{}",
-        cue.text
-    );
     let body = json!({
         "model": job.llm_model,
         "messages": [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user}
+            {
+                "role": "system",
+                "content": "You return only JSON cut positions for subtitle segmentation. Do not rewrite the text."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "Given one subtitle text, return a JSON array of 0-based Unicode character cut positions.\n\
+    Requirements:\n\
+    1. Cut only at natural phrase boundaries.\n\
+    2. Do not return 0 or the full length {char_len}.\n\
+    3. Target about {desired} subtitle parts, but you may return fewer cuts if the sentence should stay intact.\n\
+    4. Output JSON only, for example [12, 27].\n\
+    5. Do not modify the original text.\n\
+    Text:\n{}",
+                    cue.text
+                )
+            }
         ],
         "temperature": 0.1,
-        "max_tokens": 512,
+        "max_tokens": 256,
     });
+
     let url = chat_completions_url(job.llm_base_url);
     let resp = client
         .post(url)
         .timeout(Duration::from_secs(job.llm_timeout_sec.max(5)))
-        .header("Authorization", format!("Bearer {}", job.llm_api_key.trim()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", job.llm_api_key.trim()),
+        )
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .map_err(|e| format!("LLM 分段请求失败: {e}"))?;
+        .map_err(|e| format!("LLM subtitle segmentation request failed: {e}"))?;
+
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
         return Err(format!(
-            "LLM 分段 HTTP {}: {}",
+            "LLM subtitle segmentation HTTP {}: {}",
             status.as_u16(),
             text.chars().take(300).collect::<String>()
         ));
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("LLM 分段响应非 JSON: {e}"))?;
+
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("LLM subtitle response was not JSON: {e}"))?;
     let content = v
         .pointer("/choices/0/message/content")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| "LLM 分段响应缺少 content".to_string())?;
-    let cuts = parse_cut_positions(content, char_len)?;
-    let parts = split_by_char_positions(&cue.text, &cuts);
+        .ok_or_else(|| "LLM subtitle response is missing choices[0].message.content".to_string())?;
+
+    let raw_cuts = parse_cut_positions(content, char_len)?;
+    let safe_cuts = snap_llm_cuts_to_boundaries(&cue.text, &raw_cuts);
+    let parts = split_by_safe_positions(&cue.text, &safe_cuts);
     if parts.len() <= 1 {
-        return Ok(vec![cue.text.clone()]);
+        return Ok(vec![normalize_part_text(&cue.text)]);
     }
     Ok(parts)
+}
+
+fn snap_llm_cuts_to_boundaries(text: &str, raw_cuts: &[usize]) -> Vec<usize> {
+    let char_count = text.chars().count();
+    let boundaries = build_boundaries(text);
+    if boundaries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::<usize>::new();
+    let mut after = 0usize;
+    for (idx, target) in raw_cuts.iter().copied().enumerate() {
+        let reserve_tail = raw_cuts.len() - idx - 1;
+        if let Some(cut) = choose_boundary(&boundaries, after, target, reserve_tail) {
+            if cut > after && cut < char_count {
+                out.push(cut);
+                after = cut;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn parse_cut_positions(content: &str, char_len: usize) -> Result<Vec<usize>, String> {
     let trimmed = strip_json_fence(content);
     let mut cuts: Vec<usize> =
-        serde_json::from_str(&trimmed).map_err(|e| format!("LLM 分段 JSON 解析失败: {e}"))?;
+        serde_json::from_str(&trimmed).map_err(|e| format!("LLM cut JSON parse failed: {e}"))?;
     cuts.sort_unstable();
     cuts.dedup();
     if cuts.iter().any(|&c| c == 0 || c >= char_len) {
-        return Err("LLM 分段切点超出范围".into());
+        return Err("LLM cut positions were out of range.".into());
     }
     Ok(cuts)
 }
@@ -332,159 +532,264 @@ fn strip_json_fence(s: &str) -> String {
         .to_string()
 }
 
-fn apply_word_timing(
-    cue: &SubCue,
-    parts: &[String],
-    units: &[TimeUnit],
-    next_index: &mut u32,
-) -> Option<Vec<SubCue>> {
+fn apply_word_timing(cue: &SubCue, parts: &[String], units: &[TimeUnit]) -> Option<Vec<SubCue>> {
+    if parts.len() <= 1 {
+        return Some(vec![SubCue {
+            index: 0,
+            start_ms: cue.start_ms,
+            end_ms: cue.end_ms,
+            text: normalize_part_text(&cue.text),
+        }]);
+    }
+
     let overlapping: Vec<&TimeUnit> = units
         .iter()
-        .filter(|u| u.start_ms >= cue.start_ms && u.end_ms <= cue.end_ms)
+        .filter(|u| u.end_ms > cue.start_ms && u.start_ms < cue.end_ms)
+        .filter(|u| visible_chars(&u.text) > 0)
         .collect();
-    if overlapping.len() < 2 {
-        return None;
-    }
-    let total_chars: usize = overlapping
-        .iter()
-        .map(|u| visible_chars(&u.text).max(1))
-        .sum();
-    if total_chars == 0 {
-        return None;
-    }
-    let part_chars: Vec<usize> = parts.iter().map(|p| visible_chars(p).max(1)).collect();
-    let sum_part_chars: usize = part_chars.iter().sum();
-    if sum_part_chars == 0 {
+    if overlapping.len() < parts.len() {
         return None;
     }
 
-    let mut boundaries = Vec::<i64>::new();
-    let mut part_acc = 0usize;
-    let mut unit_chars_acc = 0usize;
-    let mut unit_idx = 0usize;
-    for part_char in part_chars.iter().take(part_chars.len().saturating_sub(1)) {
-        part_acc += *part_char;
-        let target = part_acc * total_chars / sum_part_chars;
-        while unit_idx < overlapping.len() {
-            unit_chars_acc += visible_chars(&overlapping[unit_idx].text).max(1);
-            let boundary = clamp_boundary(cue, overlapping[unit_idx].end_ms);
-            unit_idx += 1;
-            if unit_chars_acc >= target || unit_idx == overlapping.len() {
-                boundaries.push(boundary);
-                break;
-            }
-        }
-    }
-    if boundaries.len() + 1 != parts.len() {
+    let unit_weights: Vec<usize> = overlapping
+        .iter()
+        .map(|u| visible_chars(&u.text).max(1))
+        .collect();
+    let part_weights: Vec<usize> = parts.iter().map(|p| visible_chars(p).max(1)).collect();
+    let total_part_weight: usize = part_weights.iter().sum();
+    let total_unit_weight: usize = unit_weights.iter().sum();
+    if total_part_weight == 0 || total_unit_weight == 0 {
         return None;
     }
-    let mut start = cue.start_ms;
-    let mut out = Vec::new();
-    for (idx, text) in parts.iter().enumerate() {
-        let end = if idx + 1 == parts.len() {
-            cue.end_ms
-        } else {
-            boundaries[idx].max(start + 1)
-        };
-        out.push(SubCue {
-            index: *next_index,
-            start_ms: start,
-            end_ms: end,
-            text: text.clone(),
-        });
-        *next_index += 1;
-        start = end;
+
+    let mut prefix = Vec::with_capacity(unit_weights.len() + 1);
+    prefix.push(0usize);
+    for weight in &unit_weights {
+        let next = prefix.last().copied().unwrap_or(0).saturating_add(*weight);
+        prefix.push(next);
     }
+
+    let mut groups = Vec::<(usize, usize)>::new();
+    let mut prev_end = 0usize;
+    let mut part_acc = 0usize;
+
+    for part_idx in 0..parts.len() - 1 {
+        part_acc += part_weights[part_idx];
+        let target = part_acc * total_unit_weight / total_part_weight;
+        let min_end = prev_end + 1;
+        let max_end = overlapping.len() - (parts.len() - part_idx - 1);
+        let mut best_end = min_end;
+        let mut best_score = usize::MAX;
+
+        for end in min_end..=max_end {
+            let dist = prefix[end].abs_diff(target);
+            let start_ms = clamp_boundary_start(cue, overlapping[prev_end].start_ms);
+            let end_ms = clamp_boundary_end(cue, overlapping[end - 1].end_ms);
+            let duration_penalty = if end_ms - start_ms < MIN_SEGMENT_DURATION_MS {
+                (MIN_SEGMENT_DURATION_MS - (end_ms - start_ms)) as usize * 4
+            } else {
+                0
+            };
+            let score = dist.saturating_mul(4).saturating_add(duration_penalty);
+            if score < best_score {
+                best_score = score;
+                best_end = end;
+            }
+        }
+
+        groups.push((prev_end, best_end));
+        prev_end = best_end;
+    }
+    groups.push((prev_end, overlapping.len()));
+
+    let mut out = Vec::<SubCue>::new();
+    for (part_idx, (start_idx, end_idx)) in groups.into_iter().enumerate() {
+        if start_idx >= end_idx {
+            return None;
+        }
+        let start_ms = clamp_boundary_start(cue, overlapping[start_idx].start_ms);
+        let end_ms = clamp_boundary_end(cue, overlapping[end_idx - 1].end_ms);
+        if end_ms <= start_ms {
+            return None;
+        }
+        out.push(SubCue {
+            index: 0,
+            start_ms,
+            end_ms,
+            text: normalize_part_text(&parts[part_idx]),
+        });
+    }
+
     Some(out)
 }
 
-fn apply_approximate_timing(
-    cue: &SubCue,
-    parts: &[String],
-    next_index: &mut u32,
-) -> Vec<SubCue> {
-    let total = (cue.end_ms - cue.start_ms).max(1);
+fn clamp_boundary_start(cue: &SubCue, start_ms: i64) -> i64 {
+    start_ms.clamp(cue.start_ms, cue.end_ms.saturating_sub(1))
+}
+
+fn clamp_boundary_end(cue: &SubCue, end_ms: i64) -> i64 {
+    end_ms.clamp(cue.start_ms.saturating_add(1), cue.end_ms)
+}
+
+fn apply_approximate_timing(cue: &SubCue, parts: &[String]) -> Vec<SubCue> {
     let weights: Vec<i64> = parts
         .iter()
         .map(|p| visible_chars(p).max(1) as i64)
         .collect();
-    let weight_sum: i64 = weights.iter().sum::<i64>().max(1);
     let mut start = cue.start_ms;
     let mut out = Vec::new();
+    let mut remaining_weight: i64 = weights.iter().sum::<i64>().max(1);
+
     for (idx, text) in parts.iter().enumerate() {
-        let end = if idx + 1 == parts.len() {
+        let remaining_parts = parts.len() - idx - 1;
+        let remaining_total = cue.end_ms - start;
+        let end = if remaining_parts == 0 {
             cue.end_ms
         } else {
-            let piece = (total * weights[idx] / weight_sum).max(80);
-            (start + piece).min(cue.end_ms - ((parts.len() - idx - 1) as i64))
+            let min_tail = (remaining_parts as i64 * MIN_SEGMENT_DURATION_MS)
+                .min(remaining_total.saturating_sub(remaining_parts as i64))
+                .max(remaining_parts as i64);
+            let max_piece = (remaining_total - min_tail).max(1);
+            let ideal = (remaining_total * weights[idx] / remaining_weight).max(1);
+            let min_piece = MIN_SEGMENT_DURATION_MS.min(max_piece).max(1);
+            start + ideal.clamp(min_piece, max_piece)
         };
+
         out.push(SubCue {
-            index: *next_index,
+            index: 0,
             start_ms: start,
             end_ms: end.max(start + 1),
-            text: text.clone(),
+            text: normalize_part_text(text),
         });
-        *next_index += 1;
         start = end.max(start + 1);
+        remaining_weight = (remaining_weight - weights[idx]).max(1);
     }
+
     if let Some(last) = out.last_mut() {
         last.end_ms = cue.end_ms;
     }
     out
 }
 
-fn visible_chars(s: &str) -> usize {
-    s.chars().filter(|ch| !ch.is_whitespace() && !ch.is_control()).count()
+fn merge_short_cues(mut cues: Vec<SubCue>) -> Vec<SubCue> {
+    let mut idx = 0usize;
+    while cues.len() > 1 && idx < cues.len() {
+        let short = cue_is_too_short(&cues[idx]);
+        if !short {
+            idx += 1;
+            continue;
+        }
+
+        if idx == 0 {
+            let next = cues.remove(1);
+            cues[0].text = join_text_fragments(&cues[0].text, &next.text);
+            cues[0].end_ms = next.end_ms;
+        } else {
+            let current = cues.remove(idx);
+            let prev = &mut cues[idx - 1];
+            prev.text = join_text_fragments(&prev.text, &current.text);
+            prev.end_ms = current.end_ms;
+            idx -= 1;
+        }
+    }
+    cues
 }
 
-fn clamp_boundary(cue: &SubCue, boundary: i64) -> i64 {
-    let min = cue.start_ms + 1;
-    let max = (cue.end_ms - 1).max(min);
-    boundary.clamp(min, max)
+fn cue_is_too_short(cue: &SubCue) -> bool {
+    (cue.end_ms - cue.start_ms) < MIN_SEGMENT_DURATION_MS
+        || visible_chars(&cue.text) < MIN_SEGMENT_VISIBLE_CHARS
+}
+
+fn join_text_fragments(left: &str, right: &str) -> String {
+    let left = normalize_part_text(left);
+    let right = normalize_part_text(right);
+    if left.is_empty() {
+        return right;
+    }
+    if right.is_empty() {
+        return left;
+    }
+    if right
+        .chars()
+        .next()
+        .map(is_right_attached_punct)
+        .unwrap_or(false)
+    {
+        format!("{left}{right}")
+    } else {
+        format!("{left} {right}")
+    }
+}
+
+fn is_right_attached_punct(ch: char) -> bool {
+    matches!(ch, ',' | '.' | '!' | '?' | ';' | ':' | ')' | ']' | '}')
+}
+
+fn normalize_part_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn visible_chars(s: &str) -> usize {
+    s.chars()
+        .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+        .count()
 }
 
 fn extract_time_units_from_whisper_json(path: &Path) -> Result<Vec<TimeUnit>, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("读取 Whisper JSON 失败: {e}"))?;
-    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("解析 Whisper JSON 失败: {e}"))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read Whisper JSON: {e}"))?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse Whisper JSON: {e}"))?;
+
     let mut units = Vec::<TimeUnit>::new();
-    collect_time_units(&value, &mut units);
+    collect_time_units(&value, &mut units, true);
+    if units.is_empty() {
+        collect_time_units(&value, &mut units, false);
+    }
+
     units.sort_by_key(|u| (u.start_ms, u.end_ms));
     units.dedup_by(|a, b| a.start_ms == b.start_ms && a.end_ms == b.end_ms && a.text == b.text);
     Ok(units)
 }
 
-fn collect_time_units(value: &Value, out: &mut Vec<TimeUnit>) {
+fn collect_time_units(value: &Value, out: &mut Vec<TimeUnit>, words_only: bool) {
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_time_units(item, out);
+                collect_time_units(item, out, words_only);
             }
         }
         Value::Object(map) => {
-            if let Some(unit) = parse_time_unit_object(value) {
+            if let Some(unit) = parse_time_unit_object(value, words_only) {
                 out.push(unit);
             }
             for child in map.values() {
-                collect_time_units(child, out);
+                collect_time_units(child, out, words_only);
             }
         }
         _ => {}
     }
 }
 
-fn parse_time_unit_object(value: &Value) -> Option<TimeUnit> {
+fn parse_time_unit_object(value: &Value, words_only: bool) -> Option<TimeUnit> {
     let Value::Object(map) = value else {
         return None;
     };
-    let text = map
-        .get("word")
-        .and_then(|v| v.as_str())
-        .or_else(|| map.get("text").and_then(|v| v.as_str()))?
-        .trim()
-        .to_string();
+
+    let text = if words_only {
+        map.get("word").and_then(|v| v.as_str())?
+    } else {
+        map.get("word")
+            .and_then(|v| v.as_str())
+            .or_else(|| map.get("text").and_then(|v| v.as_str()))?
+    }
+    .trim()
+    .to_string();
+
     if text.is_empty() {
         return None;
     }
+
     let (start_ms, end_ms) = extract_times(value)?;
     (end_ms > start_ms).then_some(TimeUnit {
         start_ms,
@@ -498,6 +803,7 @@ fn extract_times(value: &Value) -> Option<(i64, i64)> {
     let Value::Object(map) = value else {
         return None;
     };
+
     if let Some(offsets) = map.get("offsets").and_then(|v| v.as_object()) {
         let start = get_num(offsets.get("from").map(|v| v as &Value))
             .or_else(|| get_num(offsets.get("start").map(|v| v as &Value)))?;
@@ -505,6 +811,7 @@ fn extract_times(value: &Value) -> Option<(i64, i64)> {
             .or_else(|| get_num(offsets.get("end").map(|v| v as &Value)))?;
         return Some((normalize_time_value(start), normalize_time_value(end)));
     }
+
     let start = get_num(map.get("start"))
         .or_else(|| get_num(map.get("from")))
         .or_else(|| get_num(map.get("t0")))?;
@@ -524,32 +831,76 @@ fn normalize_time_value(v: f64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_approximate_timing, split_by_rules};
+    use super::{
+        apply_word_timing, normalize_part_text, snap_llm_cuts_to_boundaries, split_by_rules,
+        TimeUnit,
+    };
     use crate::infra::srt::SubCue;
 
     #[test]
-    fn rules_split_long_text() {
-        let parts = split_by_rules("今天我们来讲这个问题，然后再看下一部分内容。", 2);
-        assert!(parts.len() >= 2);
+    fn rules_split_does_not_break_words() {
+        let text = "of what we actually did accomplished with the Node Editor tutorial series";
+        let parts = split_by_rules(text, 3);
+        assert!(parts
+            .iter()
+            .all(|p| !p.contains("accompl") || p.contains("accomplished")));
+        assert_eq!(parts.join(" "), normalize_part_text(text));
     }
 
     #[test]
-    fn approximate_timing_preserves_range() {
+    fn llm_cuts_snap_to_safe_word_boundaries() {
+        let text = "the series and if you haven't seen that";
+        let cuts = snap_llm_cuts_to_boundaries(text, &[24]);
+        let parts = super::split_by_safe_positions(text, &cuts);
+        assert_eq!(
+            parts,
+            vec![
+                "the series and if you".to_string(),
+                "haven't seen that".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn word_timing_assigns_monotonic_nonzero_ranges() {
         let cue = SubCue {
             index: 1,
             start_ms: 1000,
             end_ms: 5000,
             text: "hello world this is subtitle".into(),
         };
-        let mut next = 1;
-        let out = apply_approximate_timing(
-            &cue,
-            &["hello world".into(), "this is subtitle".into()],
-            &mut next,
-        );
+        let parts = vec!["hello world".to_string(), "this is subtitle".to_string()];
+        let units = vec![
+            TimeUnit {
+                start_ms: 1000,
+                end_ms: 1500,
+                text: "hello".into(),
+            },
+            TimeUnit {
+                start_ms: 1500,
+                end_ms: 2100,
+                text: "world".into(),
+            },
+            TimeUnit {
+                start_ms: 2100,
+                end_ms: 2800,
+                text: "this".into(),
+            },
+            TimeUnit {
+                start_ms: 2800,
+                end_ms: 3400,
+                text: "is".into(),
+            },
+            TimeUnit {
+                start_ms: 3400,
+                end_ms: 5000,
+                text: "subtitle".into(),
+            },
+        ];
+        let out = apply_word_timing(&cue, &parts, &units).unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(out.first().unwrap().start_ms, 1000);
-        assert_eq!(out.last().unwrap().end_ms, 5000);
+        assert!(out[0].start_ms < out[0].end_ms);
+        assert!(out[1].start_ms < out[1].end_ms);
         assert!(out[0].end_ms <= out[1].start_ms);
     }
 }

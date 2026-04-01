@@ -48,6 +48,18 @@ fn merge_config_defaults(cfg: &mut AppConfig) {
     if cfg.whisper.recognition_lang.is_empty() {
         cfg.whisper.recognition_lang = d.whisper.recognition_lang;
     }
+    if cfg.whisper.vad_threshold == 0.0 {
+        cfg.whisper.vad_threshold = d.whisper.vad_threshold;
+    }
+    if cfg.whisper.vad_min_speech_ms == 0 {
+        cfg.whisper.vad_min_speech_ms = d.whisper.vad_min_speech_ms;
+    }
+    if cfg.whisper.vad_min_silence_ms == 0 {
+        cfg.whisper.vad_min_silence_ms = d.whisper.vad_min_silence_ms;
+    }
+    if cfg.whisper.vad_max_segment_ms == 0 {
+        cfg.whisper.vad_max_segment_ms = d.whisper.vad_max_segment_ms;
+    }
     if cfg.translate.source_lang.is_empty() {
         cfg.translate.source_lang = d.translate.source_lang;
     }

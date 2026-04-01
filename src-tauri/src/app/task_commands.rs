@@ -8,9 +8,9 @@ use uuid::Uuid;
 
 use crate::domain::config::AppConfig;
 use crate::domain::task::{
-    TaskRecord, TaskStoreFile, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSE_REQUESTED,
-    STATUS_PAUSED, STATUS_PENDING, STATUS_QUEUED, STATUS_SEGMENTING, STATUS_TRANSLATING,
-    STATUS_TRANSCRIBING,
+    TaskRecord, TaskStoreFile, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSED,
+    STATUS_PAUSE_REQUESTED, STATUS_PENDING, STATUS_QUEUED, STATUS_SEGMENTING, STATUS_TRANSCRIBING,
+    STATUS_TRANSLATING,
 };
 use crate::infra::config_store;
 use crate::infra::secrets;
@@ -40,12 +40,13 @@ fn build_snapshot_summary(cfg: &AppConfig, output_dir_mode: &str) -> String {
         "视频同目录"
     };
     format!(
-        "mode={} translator={} segment={} whisper={} gpu={} src={} tgt={} output={}",
+        "mode={} translator={} segment={} whisper={} gpu={} vad={} src={} tgt={} output={}",
         cfg.subtitle.mode,
         cfg.translator.engine,
         cfg.segmentation.strategy,
         cfg.whisper.model,
         if cfg.whisper.use_gpu { "on" } else { "off" },
+        if cfg.whisper.enable_vad { "on" } else { "off" },
         cfg.translate.source_lang,
         cfg.translate.target_lang,
         output
@@ -119,6 +120,11 @@ fn apply_run_snapshot(
     task.snapshot_whisper_model = cfg.whisper.model.clone();
     task.snapshot_recognition_lang = cfg.whisper.recognition_lang.clone();
     task.snapshot_whisper_use_gpu = cfg.whisper.use_gpu;
+    task.snapshot_enable_vad = cfg.whisper.enable_vad;
+    task.snapshot_vad_threshold = cfg.whisper.vad_threshold;
+    task.snapshot_vad_min_speech_ms = cfg.whisper.vad_min_speech_ms;
+    task.snapshot_vad_min_silence_ms = cfg.whisper.vad_min_silence_ms;
+    task.snapshot_vad_max_segment_ms = cfg.whisper.vad_max_segment_ms;
     task.snapshot_subtitle_overwrite = cfg.subtitle.overwrite;
     task.snapshot_output_dir_mode = output_dir_mode.to_string();
     task.snapshot_custom_output_dir = custom_output_dir.to_string();
@@ -218,8 +224,16 @@ pub struct SetPanelOutputRequest {
 }
 
 #[tauri::command]
-pub fn list_tasks(ts: State<'_, TaskState>) -> Result<TaskListPanel, String> {
-    let store = ts.0.lock().map_err(|e| e.to_string())?;
+pub fn list_tasks(
+    root: State<'_, AppRoot>,
+    ts: State<'_, TaskState>,
+) -> Result<TaskListPanel, String> {
+    let mut store = ts.0.lock().map_err(|e| e.to_string())?;
+    let before = store.tasks.len();
+    store.tasks.retain(|t| !t.cancel_requested);
+    if store.tasks.len() != before {
+        persist(&root, &store)?;
+    }
     let show_translate_column = store.tasks.iter().any(|t| t.will_translate);
     let has_active_pipeline = store.tasks.iter().any(|t| t.is_active_pipeline());
     let needs_progress_refresh = store.tasks.iter().any(|t| {
@@ -346,6 +360,11 @@ pub fn import_videos(
             snapshot_whisper_model: String::new(),
             snapshot_recognition_lang: String::new(),
             snapshot_whisper_use_gpu: false,
+            snapshot_enable_vad: false,
+            snapshot_vad_threshold: 0.0,
+            snapshot_vad_min_speech_ms: 0,
+            snapshot_vad_min_silence_ms: 0,
+            snapshot_vad_max_segment_ms: 0,
             snapshot_subtitle_overwrite: false,
             snapshot_output_dir_mode: String::new(),
             snapshot_custom_output_dir: String::new(),
@@ -394,19 +413,17 @@ pub fn import_videos(
 }
 
 #[tauri::command]
-pub fn delete_task(root: State<'_, AppRoot>, ts: State<'_, TaskState>, id: String) -> Result<(), String> {
+pub fn delete_task(
+    root: State<'_, AppRoot>,
+    ts: State<'_, TaskState>,
+    id: String,
+) -> Result<(), String> {
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
     let pos = store
         .tasks
         .iter()
         .position(|t| t.id == id)
         .ok_or_else(|| "找不到任务".to_string())?;
-    if store.tasks[pos].is_active_pipeline() {
-        store.tasks[pos].cancel_requested = true;
-        store.tasks[pos].updated_at_ms = now_ms();
-        persist(&root, &store)?;
-        return Ok(());
-    }
     store.tasks.remove(pos);
     persist(&root, &store)
 }
@@ -421,25 +438,16 @@ pub fn clear_tasks(
     if !force && store.tasks.iter().any(|t| t.is_active_pipeline()) {
         return Err("存在执行中的任务，请确认后强制清除或先暂停".into());
     }
-    if force {
-        let tnow = now_ms();
-        store.tasks.retain_mut(|t| {
-            if t.is_active_pipeline() {
-                t.cancel_requested = true;
-                t.updated_at_ms = tnow;
-                true
-            } else {
-                false
-            }
-        });
-    } else {
-        store.tasks.clear();
-    }
+    store.tasks.clear();
     persist(&root, &store)
 }
 
 #[tauri::command]
-pub fn start_task(root: State<'_, AppRoot>, ts: State<'_, TaskState>, id: String) -> Result<(), String> {
+pub fn start_task(
+    root: State<'_, AppRoot>,
+    ts: State<'_, TaskState>,
+    id: String,
+) -> Result<(), String> {
     let cfg = config_store::load_config(&root.0).map_err(|e| e.to_string())?;
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
     let od_mode = store.output_dir_mode.clone();
@@ -506,7 +514,11 @@ pub fn start_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result
 }
 
 #[tauri::command]
-pub fn pause_task(root: State<'_, AppRoot>, ts: State<'_, TaskState>, id: String) -> Result<(), String> {
+pub fn pause_task(
+    root: State<'_, AppRoot>,
+    ts: State<'_, TaskState>,
+    id: String,
+) -> Result<(), String> {
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
     let t = store
         .tasks
@@ -548,7 +560,10 @@ pub fn pause_all_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Re
 }
 
 #[tauri::command]
-pub fn continue_all_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result<(), String> {
+pub fn continue_all_tasks(
+    root: State<'_, AppRoot>,
+    ts: State<'_, TaskState>,
+) -> Result<(), String> {
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
     let tnow = now_ms();
     for t in &mut store.tasks {
@@ -571,8 +586,8 @@ pub async fn check_transcribe_deps(
             let _ = app.emit("whisper-runtime-progress", &progress);
         })
     })
-        .await
-        .map_err(|e| format!("检测转写环境失败: {e}"))
+    .await
+    .map_err(|e| format!("检测转写环境失败: {e}"))
 }
 
 #[tauri::command]
@@ -582,11 +597,13 @@ pub fn open_output_dir(
     ts: State<'_, TaskState>,
 ) -> Result<(), String> {
     let store = ts.0.lock().map_err(|e| e.to_string())?;
-    let first = store.tasks.first().map(|t| Path::new(t.video_path.as_str()));
+    let first = store
+        .tasks
+        .first()
+        .map(|t| Path::new(t.video_path.as_str()));
     let path = resolve_open_path(&store, first)?;
     let path_str = path.to_string_lossy().to_string();
-    app
-        .opener()
+    app.opener()
         .open_path(path_str, Option::<&str>::None)
         .map_err(|e| e.to_string())
 }

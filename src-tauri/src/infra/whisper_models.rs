@@ -6,8 +6,7 @@ use serde::Serialize;
 
 use super::paths::models_whisper_dir;
 
-pub const DEFAULT_DOWNLOAD_BASE: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+pub const DEFAULT_DOWNLOAD_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogEntry {

@@ -98,9 +98,7 @@ pub fn resolve_bilingual_srt_path(
 mod tests {
     use std::path::Path;
 
-    use super::{
-        resolve_bilingual_srt_path, resolve_original_srt_path, stable_path_hash,
-    };
+    use super::{resolve_bilingual_srt_path, resolve_original_srt_path, stable_path_hash};
 
     #[test]
     fn stable_hash_is_deterministic() {
@@ -114,22 +112,16 @@ mod tests {
     fn original_path_uses_video_dir_without_hash() {
         let video = Path::new("C:/videos/demo.mp4");
         let output =
-            resolve_original_srt_path(video, "C:/videos/demo.mp4", "video_dir", "", "en")
-                .unwrap();
+            resolve_original_srt_path(video, "C:/videos/demo.mp4", "video_dir", "", "en").unwrap();
         assert_eq!(output, Path::new("C:/videos/demo_en.srt"));
     }
 
     #[test]
     fn original_path_uses_hash_in_custom_dir() {
         let video = Path::new("C:/videos/demo.mp4");
-        let output = resolve_original_srt_path(
-            video,
-            "C:/videos/demo.mp4",
-            "custom",
-            "D:/subs",
-            "zh",
-        )
-        .unwrap();
+        let output =
+            resolve_original_srt_path(video, "C:/videos/demo.mp4", "custom", "D:/subs", "zh")
+                .unwrap();
         let file_name = output.file_name().unwrap().to_string_lossy();
         assert!(output.starts_with("D:/subs"));
         assert!(file_name.starts_with("demo_"));

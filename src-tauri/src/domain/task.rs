@@ -46,6 +46,16 @@ pub struct TaskRecord {
     #[serde(default)]
     pub snapshot_whisper_use_gpu: bool,
     #[serde(default)]
+    pub snapshot_enable_vad: bool,
+    #[serde(default)]
+    pub snapshot_vad_threshold: f32,
+    #[serde(default)]
+    pub snapshot_vad_min_speech_ms: u32,
+    #[serde(default)]
+    pub snapshot_vad_min_silence_ms: u32,
+    #[serde(default)]
+    pub snapshot_vad_max_segment_ms: u32,
+    #[serde(default)]
     pub snapshot_subtitle_overwrite: bool,
     #[serde(default)]
     pub snapshot_output_dir_mode: String,

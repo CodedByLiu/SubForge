@@ -33,10 +33,7 @@ fn collect_nvml_gpus() -> (Vec<GpuInfoDto>, bool) {
             for i in 0..count {
                 if let Ok(dev) = nvml.device_by_index(i) {
                     let name = dev.name().unwrap_or_else(|_| "NVIDIA GPU".into());
-                    let mem_mb = dev
-                        .memory_info()
-                        .ok()
-                        .map(|m| m.total / (1024 * 1024));
+                    let mem_mb = dev.memory_info().ok().map(|m| m.total / (1024 * 1024));
                     out.push(GpuInfoDto {
                         name,
                         memory_total_mb: mem_mb,
@@ -70,8 +67,7 @@ fn fallback_gpu_names_from_os() -> Vec<String> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    text
-        .lines()
+    text.lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
@@ -88,14 +84,13 @@ fn primary_vram_mb(gpus: &[GpuInfoDto]) -> Option<u64> {
 }
 
 /// §6.2 推荐档位（文案与规格一致，仅供参考）
-pub fn recommend_whisper_models(use_gpu: bool, primary_vram_mb: Option<u64>) -> (Vec<String>, String) {
+pub fn recommend_whisper_models(
+    use_gpu: bool,
+    primary_vram_mb: Option<u64>,
+) -> (Vec<String>, String) {
     if !use_gpu {
         return (
-            vec![
-                "tiny".into(),
-                "base".into(),
-                "small".into(),
-            ],
+            vec!["tiny".into(), "base".into(), "small".into()],
             "未启用 GPU 或按 CPU 推理：推荐 tiny～base，视机器可适当使用 small".into(),
         );
     }

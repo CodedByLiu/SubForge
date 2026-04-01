@@ -5,6 +5,15 @@ use which::which;
 
 use super::whisper_runtime::managed_whisper_dir;
 
+#[derive(Debug, Clone)]
+pub struct WhisperVadOptions<'a> {
+    pub model_path: &'a Path,
+    pub threshold: f32,
+    pub min_speech_ms: u32,
+    pub min_silence_ms: u32,
+    pub max_segment_ms: u32,
+}
+
 pub fn resolve_whisper_cli(app_dir: &Path, preferred: &str) -> Result<PathBuf, String> {
     let p = preferred.trim();
     if !p.is_empty() {
@@ -80,6 +89,7 @@ pub fn run_whisper_srt_json(
     threads: u32,
     force_cpu: bool,
     out_prefix: &Path,
+    vad: Option<&WhisperVadOptions<'_>>,
 ) -> Result<(), String> {
     let work_dir = out_prefix
         .parent()
@@ -94,7 +104,11 @@ pub fn run_whisper_srt_json(
 
     let lang_arg = {
         let t = lang.trim();
-        if t.is_empty() { "auto" } else { t }
+        if t.is_empty() {
+            "auto"
+        } else {
+            t
+        }
     };
 
     let mut cmd = std::process::Command::new(cli);
@@ -106,22 +120,62 @@ pub fn run_whisper_srt_json(
     if force_cpu {
         cmd.arg("-ngl").arg("0");
     }
-    cmd.arg("-oj");
+    if let Some(vad) = vad {
+        cmd.arg("--vad");
+        cmd.arg("-vm").arg(vad.model_path);
+        cmd.arg("-vt").arg(format!("{:.2}", vad.threshold));
+        cmd.arg("-vspd").arg(vad.min_speech_ms.to_string());
+        cmd.arg("-vsd").arg(vad.min_silence_ms.to_string());
+        cmd.arg("-vmsd")
+            .arg(format!("{:.3}", vad.max_segment_ms as f64 / 1000.0));
+    }
     cmd.arg("-osrt");
     cmd.arg("-of").arg(&prefix_name);
 
+    run_whisper_command(cmd)?;
+
+    let mut json_cmd = std::process::Command::new(cli);
+    json_cmd.current_dir(work_dir);
+    json_cmd.arg("-m").arg(model);
+    json_cmd.arg("-f").arg(wav);
+    json_cmd.arg("-l").arg(lang_arg);
+    json_cmd.arg("-t").arg(threads.to_string());
+    if force_cpu {
+        json_cmd.arg("-ngl").arg("0");
+    }
+    if let Some(vad) = vad {
+        json_cmd.arg("--vad");
+        json_cmd.arg("-vm").arg(vad.model_path);
+        json_cmd.arg("-vt").arg(format!("{:.2}", vad.threshold));
+        json_cmd.arg("-vspd").arg(vad.min_speech_ms.to_string());
+        json_cmd.arg("-vsd").arg(vad.min_silence_ms.to_string());
+        json_cmd
+            .arg("-vmsd")
+            .arg(format!("{:.3}", vad.max_segment_ms as f64 / 1000.0));
+    }
+    json_cmd.arg("-ml").arg("1");
+    json_cmd.arg("-sow");
+    json_cmd.arg("-ojf");
+    json_cmd.arg("-of").arg(&prefix_name);
+
+    run_whisper_command(json_cmd)?;
+    Ok(())
+}
+
+fn run_whisper_command(mut cmd: std::process::Command) -> Result<(), String> {
     let out = cmd
         .output()
         .map_err(|e| format!("启动 Whisper 失败: {e}"))?;
-    if !out.status.success() {
-        let mut msg = String::from_utf8_lossy(&out.stderr).to_string();
-        if msg.trim().is_empty() {
-            msg = String::from_utf8_lossy(&out.stdout).to_string();
-        }
-        let msg: String = msg.chars().take(4000).collect();
-        return Err(format!("Whisper 识别失败: {msg}"));
+    if out.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    let mut msg = String::from_utf8_lossy(&out.stderr).to_string();
+    if msg.trim().is_empty() {
+        msg = String::from_utf8_lossy(&out.stdout).to_string();
+    }
+    let msg: String = msg.chars().take(4000).collect();
+    Err(format!("Whisper 识别失败: {msg}"))
 }
 
 pub fn read_language_from_whisper_json(json_path: &Path, fallback: &str) -> String {

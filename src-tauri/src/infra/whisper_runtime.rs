@@ -10,6 +10,8 @@ use super::paths::{bin_dir, temp_dir};
 
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest";
+const DEFAULT_VAD_DOWNLOAD_BASE: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main";
+const VAD_MODEL_FILE_NAME: &str = "ggml-silero-v6.2.0.bin";
 
 #[derive(Clone, Serialize)]
 pub struct WhisperRuntimeProgress {
@@ -26,6 +28,10 @@ pub fn managed_whisper_dir(app_dir: &Path) -> PathBuf {
 
 pub fn managed_whisper_cli_path(app_dir: &Path) -> PathBuf {
     managed_whisper_dir(app_dir).join(whisper_cli_file_name())
+}
+
+pub fn managed_whisper_vad_model_path(app_dir: &Path) -> PathBuf {
+    managed_whisper_dir(app_dir).join(VAD_MODEL_FILE_NAME)
 }
 
 pub fn ensure_managed_whisper_cli(
@@ -134,7 +140,13 @@ pub fn ensure_managed_whisper_cli(
             .map_err(|e| format!("写入 whisper.cpp 压缩包失败: {e}"))?;
         received += n as u64;
         let pct = total
-            .map(|t| if t == 0 { 0 } else { ((received * 88) / t).min(88) as u32 + 2 })
+            .map(|t| {
+                if t == 0 {
+                    0
+                } else {
+                    ((received * 88) / t).min(88) as u32 + 2
+                }
+            })
             .unwrap_or(0);
         if pct >= last_pct.saturating_add(2) || total == Some(received) {
             last_pct = pct;
@@ -176,12 +188,146 @@ pub fn ensure_managed_whisper_cli(
     }
 }
 
+pub fn ensure_managed_whisper_vad_model(
+    app_dir: &Path,
+    mirror_url: &str,
+    prefer_mirror: bool,
+    download_url: &str,
+    mut on_progress: impl FnMut(WhisperRuntimeProgress),
+) -> Result<PathBuf, String> {
+    let managed_model = managed_whisper_vad_model_path(app_dir);
+    if managed_model.exists() {
+        on_progress(WhisperRuntimeProgress {
+            phase: "done".into(),
+            message: "Whisper VAD 模型已就绪".into(),
+            percent: 100,
+            bytes_received: 0,
+            bytes_total: None,
+        });
+        return Ok(managed_model);
+    }
+
+    let managed_dir = managed_whisper_dir(app_dir);
+    fs::create_dir_all(&managed_dir).map_err(|e| format!("创建目录失败: {e}"))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("初始化下载客户端失败: {e}"))?;
+
+    let base = resolve_vad_download_base(mirror_url, prefer_mirror, download_url);
+    let url = format!("{}/{}", base, VAD_MODEL_FILE_NAME);
+
+    on_progress(WhisperRuntimeProgress {
+        phase: "connecting".into(),
+        message: "正在获取 Whisper VAD 模型…".into(),
+        percent: 0,
+        bytes_received: 0,
+        bytes_total: None,
+    });
+
+    let mut response = client
+        .get(&url)
+        .header("User-Agent", "SubForge/0.1 whisper-vad-runtime")
+        .send()
+        .map_err(|e| format!("下载 Whisper VAD 模型失败: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("下载 Whisper VAD 模型失败: {e}"))?;
+
+    let total = response.content_length();
+    let tmp_path = temp_dir(app_dir).join("whisper-vad-model.bin.download");
+    if let Some(parent) = tmp_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    }
+    let mut out_file = File::create(&tmp_path).map_err(|e| format!("创建临时文件失败: {e}"))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut received = 0u64;
+    let mut last_pct = 0u32;
+    loop {
+        let n = response
+            .read(&mut buf)
+            .map_err(|e| format!("读取 Whisper VAD 下载流失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out_file
+            .write_all(&buf[..n])
+            .map_err(|e| format!("写入 Whisper VAD 模型失败: {e}"))?;
+        received += n as u64;
+        let pct = total
+            .map(|t| {
+                if t == 0 {
+                    0
+                } else {
+                    ((received * 96) / t).min(96) as u32 + 2
+                }
+            })
+            .unwrap_or(0);
+        if pct >= last_pct.saturating_add(2) || total == Some(received) {
+            last_pct = pct;
+            on_progress(WhisperRuntimeProgress {
+                phase: "downloading".into(),
+                message: format!(
+                    "正在下载 Whisper VAD 模型… {}",
+                    format_total(total, received)
+                ),
+                percent: pct,
+                bytes_received: received,
+                bytes_total: total,
+            });
+        }
+    }
+    out_file
+        .flush()
+        .map_err(|e| format!("保存 Whisper VAD 模型失败: {e}"))?;
+
+    if let Some(parent) = managed_model.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建运行时目录失败: {e}"))?;
+    }
+    fs::rename(&tmp_path, &managed_model).map_err(|e| format!("安装 Whisper VAD 模型失败: {e}"))?;
+
+    on_progress(WhisperRuntimeProgress {
+        phase: "done".into(),
+        message: "Whisper VAD 模型下载完成".into(),
+        percent: 100,
+        bytes_received: received,
+        bytes_total: total,
+    });
+    Ok(managed_model)
+}
+
 fn whisper_cli_file_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "whisper-cli.exe"
     } else {
         "whisper-cli"
     }
+}
+
+fn resolve_vad_download_base(mirror_url: &str, prefer_mirror: bool, download_url: &str) -> String {
+    let primary =
+        super::whisper_models::resolve_download_base(mirror_url, prefer_mirror, download_url);
+    rewrite_hf_repo_base(&primary, "ggml-org/whisper-vad")
+        .unwrap_or_else(|| DEFAULT_VAD_DOWNLOAD_BASE.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn rewrite_hf_repo_base(input: &str, repo: &str) -> Option<String> {
+    let url = reqwest::Url::parse(input).ok()?;
+    let host = url.host_str()?;
+    if !(host.contains("huggingface.co") || host.contains("hf-mirror.com")) {
+        return None;
+    }
+    let mut out = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    out.push('/');
+    out.push_str(repo.trim_matches('/'));
+    out.push_str("/resolve/main");
+    Some(out)
 }
 
 fn extract_release_zip(app_dir: &Path, zip_path: &Path) -> Result<(), String> {

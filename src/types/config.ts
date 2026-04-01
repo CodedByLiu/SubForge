@@ -18,6 +18,11 @@ export interface WhisperConfig {
   model: string;
   use_gpu: boolean;
   recognition_lang: string;
+  enable_vad: boolean;
+  vad_threshold: number;
+  vad_min_speech_ms: number;
+  vad_min_silence_ms: number;
+  vad_max_segment_ms: number;
   ffmpeg_path: string;
   whisper_cli_path: string;
   download_url: string;
@@ -109,6 +114,11 @@ export function defaultAppConfig(): AppConfig {
       model: "base",
       use_gpu: true,
       recognition_lang: "auto",
+      enable_vad: true,
+      vad_threshold: 0.5,
+      vad_min_speech_ms: 500,
+      vad_min_silence_ms: 300,
+      vad_max_segment_ms: 30_000,
       ffmpeg_path: "",
       whisper_cli_path: "",
       download_url: "",

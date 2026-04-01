@@ -6,10 +6,8 @@ use tokio::io::AsyncWriteExt;
 use crate::app::state::{AppRoot, WhisperDownloadLock};
 use crate::infra::config_store;
 use crate::infra::hardware::{gather_hardware_info, HardwareInfoDto};
+use crate::infra::whisper_models::{self, WhisperModelsListDto};
 use crate::infra::whisper_runtime;
-use crate::infra::whisper_models::{
-    self, WhisperModelsListDto,
-};
 
 #[derive(Clone, Serialize)]
 pub struct WhisperDownloadProgress {
@@ -60,10 +58,12 @@ pub async fn download_whisper_model(
     let cfg = config_store::load_config(&root.0).map_err(|e| e.to_string())?;
     if cfg.whisper.whisper_cli_path.trim().is_empty() {
         let app_dir = root.0.clone();
-        tauri::async_runtime::spawn_blocking(move || whisper_runtime::ensure_managed_whisper_cli(&app_dir, |_| {}))
-            .await
-            .map_err(|e| format!("准备 Whisper CLI 失败: {e}"))?
-            .map_err(|e| format!("准备 Whisper CLI 失败: {e}"))?;
+        tauri::async_runtime::spawn_blocking(move || {
+            whisper_runtime::ensure_managed_whisper_cli(&app_dir, |_| {})
+        })
+        .await
+        .map_err(|e| format!("准备 Whisper CLI 失败: {e}"))?
+        .map_err(|e| format!("准备 Whisper CLI 失败: {e}"))?;
     }
     let base = whisper_models::resolve_download_base(
         &cfg.whisper.mirror_url,
@@ -105,10 +105,7 @@ pub async fn download_whisper_model(
         .map_err(|e| format!("下载请求失败: {e}"))?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "HTTP {}：请检查镜像地址或网络",
-            response.status()
-        ));
+        return Err(format!("HTTP {}：请检查镜像地址或网络", response.status()));
     }
 
     let total = response.content_length();
@@ -152,7 +149,11 @@ pub async fn download_whisper_model(
                 bytes_received: received,
                 bytes_total: total,
                 phase: "downloading".into(),
-                message: format!("已下载 {} / {}", format_bytes(received), format_total(total)),
+                message: format!(
+                    "已下载 {} / {}",
+                    format_bytes(received),
+                    format_total(total)
+                ),
             });
         }
     }

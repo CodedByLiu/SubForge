@@ -56,7 +56,11 @@ fn glossary_block(entries: &[GlossaryEntry], case_sensitive: bool) -> String {
         if e.source.trim().is_empty() {
             continue;
         }
-        s.push_str(&format!("- \"{}\" → \"{}\"\n", e.source.trim(), e.target.trim()));
+        s.push_str(&format!(
+            "- \"{}\" → \"{}\"\n",
+            e.source.trim(),
+            e.target.trim()
+        ));
     }
     s
 }
@@ -114,9 +118,7 @@ fn parse_batch_json(content: &str, expected_ids: &[u32]) -> Result<Vec<String>, 
     }
     let mut ordered = Vec::with_capacity(expected_ids.len());
     for id in expected_ids {
-        let t = map
-            .remove(id)
-            .ok_or_else(|| format!("缺少 id={id}"))?;
+        let t = map.remove(id).ok_or_else(|| format!("缺少 id={id}"))?;
         ordered.push(t);
     }
     Ok(ordered)
@@ -151,10 +153,7 @@ fn call_chat(
     let resp = client
         .post(url)
         .timeout(timeout)
-        .header(
-            "Authorization",
-            format!("Bearer {}", api_key.trim()),
-        )
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -246,15 +245,7 @@ fn translate_indices_once(
     }
     let url = chat_completions_url(job.base_url);
     let timeout = Duration::from_secs(job.timeout_sec.max(5));
-    let content = call_chat(
-        client,
-        &url,
-        job.api_key,
-        job.model,
-        &sys,
-        &user,
-        timeout,
-    )?;
+    let content = call_chat(client, &url, job.api_key, job.model, &sys, &user, timeout)?;
     parse_batch_json(&content, &ids)
 }
 
@@ -311,11 +302,7 @@ fn translate_indices_recursive(
                     return (v, false);
                 }
                 Ok(v) => {
-                    log::warn!(
-                        "翻译批次条数异常: 期望 {} 得到 {}",
-                        indices.len(),
-                        v.len()
-                    );
+                    log::warn!("翻译批次条数异常: 期望 {} 得到 {}", indices.len(), v.len());
                 }
                 Err(e) => {
                     log::warn!("翻译批次失败: {e}");

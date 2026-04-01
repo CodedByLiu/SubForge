@@ -543,6 +543,76 @@ export function SettingsPage() {
               </span>
             </div>
           </label>
+          <label
+            className="field"
+            style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}
+          >
+            <input
+              type="checkbox"
+              checked={cfg.whisper.enable_vad}
+              onChange={(e) => setWhisper({ enable_vad: e.target.checked })}
+            />
+            <span>启用 VAD（过滤音乐 / 静音 / 非语音）</span>
+          </label>
+          <label className="field">
+            <span>VAD 阈值</span>
+            <input
+              type="number"
+              min={0.1}
+              max={0.9}
+              step={0.05}
+              value={cfg.whisper.vad_threshold}
+              onChange={(e) =>
+                setWhisper({ vad_threshold: Number(e.target.value) || 0.1 })
+              }
+            />
+          </label>
+          <label className="field">
+            <span>最小语音时长（毫秒）</span>
+            <input
+              type="number"
+              min={100}
+              max={5000}
+              step={50}
+              value={cfg.whisper.vad_min_speech_ms}
+              onChange={(e) =>
+                setWhisper({ vad_min_speech_ms: Number(e.target.value) || 100 })
+              }
+            />
+          </label>
+          <label className="field">
+            <span>最小静音时长（毫秒）</span>
+            <input
+              type="number"
+              min={50}
+              max={3000}
+              step={50}
+              value={cfg.whisper.vad_min_silence_ms}
+              onChange={(e) =>
+                setWhisper({ vad_min_silence_ms: Number(e.target.value) || 50 })
+              }
+            />
+          </label>
+          <label className="field">
+            <span>单段最大语音时长（毫秒）</span>
+            <input
+              type="number"
+              min={3000}
+              max={30000}
+              step={500}
+              value={cfg.whisper.vad_max_segment_ms}
+              onChange={(e) =>
+                setWhisper({ vad_max_segment_ms: Number(e.target.value) || 3000 })
+              }
+            />
+          </label>
+          {!cfg.whisper.enable_vad ? (
+            <div className="field" style={{ gridColumn: "1 / -1" }}>
+              <p className="muted" style={{ margin: 0 }}>
+                关闭后仍可转写，但片头音乐、长静音场景下时间轴可能更不稳定。
+              </p>
+            </div>
+          ) : null}
           <label className="field">
             <span>ffmpeg 可执行文件（可选）</span>
             <input
@@ -645,6 +715,12 @@ export function SettingsPage() {
                     ? `（${depsResult.whisper_resolved}）`
                     : ""}
                   <div className="muted">{depsResult.whisper_detail}</div>
+                </div>
+                <div style={{ marginTop: "0.35rem" }}>
+                  <span className="muted">VAD：</span>
+                  {depsResult.vad_enabled ? (depsResult.vad_ok ? "可用" : "不可用") : "已关闭"}
+                  {depsResult.vad_model_path ? `（${depsResult.vad_model_path}）` : ""}
+                  <div className="muted">{depsResult.vad_detail}</div>
                 </div>
                 <div style={{ marginTop: "0.35rem" }}>
                   <span className="muted">当前配置模型文件：</span>

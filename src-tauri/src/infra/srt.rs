@@ -44,11 +44,17 @@ pub fn parse_srt(raw: &str) -> Result<Vec<SubCue>, String> {
     let normalized = raw.replace('\r', "");
     let mut out = Vec::new();
     for block in normalized.split("\n\n") {
-        let lines: Vec<&str> = block.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
         if lines.len() < 2 {
             continue;
         }
-        let idx: u32 = lines[0].parse().map_err(|_| format!("无效序号行: {}", lines[0]))?;
+        let idx: u32 = lines[0]
+            .parse()
+            .map_err(|_| format!("无效序号行: {}", lines[0]))?;
         let (start_ms, end_ms) =
             parse_time_line(lines[1]).ok_or_else(|| format!("无效时间轴: {}", lines[1]))?;
         let text = lines[2..].join("\n");
@@ -81,7 +87,10 @@ pub fn format_srt(cues: &[SubCue]) -> String {
 }
 
 /// 双语：上行译文、下行原文；时间轴与 `sources` 一致
-pub fn build_bilingual_cues(sources: &[SubCue], translated_lines: &[String]) -> Result<Vec<SubCue>, String> {
+pub fn build_bilingual_cues(
+    sources: &[SubCue],
+    translated_lines: &[String],
+) -> Result<Vec<SubCue>, String> {
     if sources.len() != translated_lines.len() {
         return Err(format!(
             "双语行数不一致: {} / {}",

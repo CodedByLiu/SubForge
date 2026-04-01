@@ -65,8 +65,7 @@ pub fn load_secrets(app_dir: &Path) -> Result<SecretPayload> {
     let plain = cipher
         .decrypt(nonce, cipher_bytes.as_ref())
         .map_err(|_| anyhow!("解密失败，密钥或文件可能已损坏"))?;
-    let s: SecretPayload =
-        serde_json::from_slice(&plain).context("解密后的密钥 JSON 无效")?;
+    let s: SecretPayload = serde_json::from_slice(&plain).context("解密后的密钥 JSON 无效")?;
     Ok(s)
 }
 

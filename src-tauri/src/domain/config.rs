@@ -40,6 +40,16 @@ pub struct WhisperConfig {
     #[serde(default = "default_true")]
     pub use_gpu: bool,
     pub recognition_lang: String,
+    #[serde(default = "default_true")]
+    pub enable_vad: bool,
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    #[serde(default = "default_vad_min_speech_ms")]
+    pub vad_min_speech_ms: u32,
+    #[serde(default = "default_vad_min_silence_ms")]
+    pub vad_min_silence_ms: u32,
+    #[serde(default = "default_vad_max_segment_ms")]
+    pub vad_max_segment_ms: u32,
     /// 留空则从 PATH 查找 `ffmpeg` / `ffmpeg.exe`
     #[serde(default)]
     pub ffmpeg_path: String,
@@ -157,6 +167,22 @@ fn default_srt() -> String {
     "srt".into()
 }
 
+fn default_vad_threshold() -> f32 {
+    0.5
+}
+
+fn default_vad_min_speech_ms() -> u32 {
+    500
+}
+
+fn default_vad_min_silence_ms() -> u32 {
+    300
+}
+
+fn default_vad_max_segment_ms() -> u32 {
+    30_000
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -178,6 +204,11 @@ impl Default for AppConfig {
                 model: "base".into(),
                 use_gpu: true,
                 recognition_lang: "auto".into(),
+                enable_vad: true,
+                vad_threshold: default_vad_threshold(),
+                vad_min_speech_ms: default_vad_min_speech_ms(),
+                vad_min_silence_ms: default_vad_min_silence_ms(),
+                vad_max_segment_ms: default_vad_max_segment_ms(),
                 ffmpeg_path: String::new(),
                 whisper_cli_path: String::new(),
                 download_url: String::new(),
@@ -225,6 +256,21 @@ impl AppConfig {
         if self.translate.max_segment_chars < 64 || self.translate.max_segment_chars > 32000 {
             return Err("每段最大字符数需在合理范围内".into());
         }
+        if !(0.1..=0.9).contains(&self.whisper.vad_threshold) {
+            return Err("VAD 阈值需在 0.1–0.9 之间".into());
+        }
+        if self.whisper.vad_min_speech_ms < 100 || self.whisper.vad_min_speech_ms > 5000 {
+            return Err("VAD 最小语音时长需在 100–5000 毫秒之间".into());
+        }
+        if self.whisper.vad_min_silence_ms < 50 || self.whisper.vad_min_silence_ms > 3000 {
+            return Err("VAD 最小静音时长需在 50–3000 毫秒之间".into());
+        }
+        if self.whisper.vad_max_segment_ms < 3000 || self.whisper.vad_max_segment_ms > 30000 {
+            return Err("VAD 单段最大语音时长需在 3000–30000 毫秒之间".into());
+        }
+        if self.whisper.vad_max_segment_ms <= self.whisper.vad_min_speech_ms {
+            return Err("VAD 单段最大语音时长需大于最小语音时长".into());
+        }
         if self.segmentation.max_chars_per_segment < 8
             || self.segmentation.max_chars_per_segment > 500
         {
@@ -257,16 +303,15 @@ impl AppConfig {
             return Err("分段时间策略无效".into());
         }
         let mode = self.subtitle.mode.as_str();
-        if !matches!(
-            mode,
-            "original_only" | "dual_files" | "bilingual_single"
-        ) {
+        if !matches!(mode, "original_only" | "dual_files" | "bilingual_single") {
             return Err("字幕生成模式无效".into());
         }
-        if self.subtitle.output_dir_mode != "video_dir" && self.subtitle.output_dir_mode != "custom" {
+        if self.subtitle.output_dir_mode != "video_dir" && self.subtitle.output_dir_mode != "custom"
+        {
             return Err("输出目录模式无效".into());
         }
-        if self.subtitle.output_dir_mode == "custom" && self.subtitle.custom_output_dir.trim().is_empty()
+        if self.subtitle.output_dir_mode == "custom"
+            && self.subtitle.custom_output_dir.trim().is_empty()
         {
             return Err("自定义输出目录不能为空".into());
         }
@@ -323,6 +368,13 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.subtitle.output_dir_mode = "custom".into();
         cfg.subtitle.custom_output_dir.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_vad_threshold() {
+        let mut cfg = AppConfig::default();
+        cfg.whisper.vad_threshold = 0.95;
         assert!(cfg.validate().is_err());
     }
 }

@@ -34,6 +34,10 @@ export interface TranscribeDepsCheck {
   whisper_resolved: string | null;
   whisper_ok: boolean;
   whisper_detail: string;
+  vad_enabled: boolean;
+  vad_model_path: string | null;
+  vad_ok: boolean;
+  vad_detail: string;
   model_path: string | null;
   model_ok: boolean;
   model_detail: string;

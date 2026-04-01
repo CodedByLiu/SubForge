@@ -22,14 +22,14 @@ use crate::infra::paths::temp_dir;
 use crate::infra::runner_limits::{effective_max_parallel_tasks, LlmRequestSlots};
 use crate::infra::secrets;
 use crate::infra::srt::{build_bilingual_cues, format_srt, parse_srt, SubCue};
-use crate::infra::subtitle_segmentation::{segment_cues, SegmentationJob};
 use crate::infra::subtitle_output::{resolve_bilingual_srt_path, resolve_original_srt_path};
+use crate::infra::subtitle_segmentation::{segment_cues, SegmentationJob};
 use crate::infra::task_store;
 use crate::infra::whisper_models::model_file_path;
 use crate::infra::whisper_runtime;
 use crate::infra::whisper_tool::{
     expected_whisper_sidecar_paths, read_language_from_whisper_json, resolve_whisper_cli,
-    run_whisper_srt_json,
+    run_whisper_srt_json, WhisperVadOptions,
 };
 
 #[derive(serde::Serialize, Clone)]
@@ -83,10 +83,7 @@ fn mid_run_poll(ts: &Arc<Mutex<TaskStoreFile>>, id: &str) -> MidRun {
 }
 
 fn translation_should_abort(ts: &Arc<Mutex<TaskStoreFile>>, id: &str) -> bool {
-    matches!(
-        mid_run_poll(ts, id),
-        MidRun::Pause | MidRun::Cancel
-    )
+    matches!(mid_run_poll(ts, id), MidRun::Pause | MidRun::Cancel)
 }
 
 fn remove_task_if_present(
@@ -174,13 +171,7 @@ fn is_retryable_task_error(msg: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn fail_task(
-    app: &AppHandle,
-    ts: &Arc<Mutex<TaskStoreFile>>,
-    root: &AppRoot,
-    id: &str,
-    msg: &str,
-) {
+fn fail_task(app: &AppHandle, ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id: &str, msg: &str) {
     let mut g = match ts.lock() {
         Ok(x) => x,
         _ => return,
@@ -201,10 +192,7 @@ fn fail_task(
             t.progress = 0;
             t.phase = format!("retry_{}", t.retry_attempts);
             t.cancel_requested = false;
-            t.translate_note = Some(format!(
-                "自动重试 {}/{}",
-                t.retry_attempts, retry_limit
-            ));
+            t.translate_note = Some(format!("自动重试 {}/{}", t.retry_attempts, retry_limit));
             t.segmentation_note = None;
             t.error_message = Some(msg.chars().take(4000).collect());
             t.original_preview = None;
@@ -243,6 +231,11 @@ struct JobSnapshot {
     whisper_model: String,
     recognition_lang: String,
     whisper_use_gpu: bool,
+    whisper_enable_vad: bool,
+    vad_threshold: f32,
+    vad_min_speech_ms: u32,
+    vad_min_silence_ms: u32,
+    vad_max_segment_ms: u32,
     subtitle_overwrite: bool,
     output_dir_mode: String,
     custom_output_dir: String,
@@ -273,11 +266,7 @@ struct JobSnapshot {
     translate_concurrency: u32,
 }
 
-fn load_job(
-    ts: &Arc<Mutex<TaskStoreFile>>,
-    task_id: &str,
-    cfg: &AppConfig,
-) -> Option<JobSnapshot> {
+fn load_job(ts: &Arc<Mutex<TaskStoreFile>>, task_id: &str, cfg: &AppConfig) -> Option<JobSnapshot> {
     let g = ts.lock().ok()?;
     let t = g.tasks.iter().find(|x| x.id == task_id)?;
     let snap = !t.snapshot_whisper_model.trim().is_empty();
@@ -289,12 +278,12 @@ fn load_job(
     } else {
         (g.output_dir_mode.clone(), g.custom_output_dir.clone())
     };
-    let glossary: Vec<GlossaryEntry> = if snap && !t.snapshot_translate_glossary_json.trim().is_empty()
-    {
-        serde_json::from_str(&t.snapshot_translate_glossary_json).unwrap_or_default()
-    } else {
-        cfg.translate.glossary.clone()
-    };
+    let glossary: Vec<GlossaryEntry> =
+        if snap && !t.snapshot_translate_glossary_json.trim().is_empty() {
+            serde_json::from_str(&t.snapshot_translate_glossary_json).unwrap_or_default()
+        } else {
+            cfg.translate.glossary.clone()
+        };
     Some(JobSnapshot {
         video_path: t.video_path.clone(),
         whisper_model: if snap {
@@ -311,6 +300,31 @@ fn load_job(
             t.snapshot_whisper_use_gpu
         } else {
             cfg.whisper.use_gpu
+        },
+        whisper_enable_vad: if snap {
+            t.snapshot_enable_vad
+        } else {
+            cfg.whisper.enable_vad
+        },
+        vad_threshold: if snap && t.snapshot_vad_threshold > 0.0 {
+            t.snapshot_vad_threshold
+        } else {
+            cfg.whisper.vad_threshold
+        },
+        vad_min_speech_ms: if snap && t.snapshot_vad_min_speech_ms > 0 {
+            t.snapshot_vad_min_speech_ms
+        } else {
+            cfg.whisper.vad_min_speech_ms
+        },
+        vad_min_silence_ms: if snap && t.snapshot_vad_min_silence_ms > 0 {
+            t.snapshot_vad_min_silence_ms
+        } else {
+            cfg.whisper.vad_min_silence_ms
+        },
+        vad_max_segment_ms: if snap && t.snapshot_vad_max_segment_ms > 0 {
+            t.snapshot_vad_max_segment_ms
+        } else {
+            cfg.whisper.vad_max_segment_ms
         },
         subtitle_overwrite: if snap {
             t.snapshot_subtitle_overwrite
@@ -467,12 +481,9 @@ fn cache_task_outputs(
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
         t.original_preview = original_preview;
         t.translated_preview = translated_preview;
-        t.original_output_path =
-            original_output_path.map(|p| p.to_string_lossy().to_string());
-        t.translated_output_path =
-            translated_output_path.map(|p| p.to_string_lossy().to_string());
-        t.bilingual_output_path =
-            bilingual_output_path.map(|p| p.to_string_lossy().to_string());
+        t.original_output_path = original_output_path.map(|p| p.to_string_lossy().to_string());
+        t.translated_output_path = translated_output_path.map(|p| p.to_string_lossy().to_string());
+        t.bilingual_output_path = bilingual_output_path.map(|p| p.to_string_lossy().to_string());
         t.updated_at_ms = now_ms();
         let _ = task_store::save_task_store_file(&root.0, &g);
     }
@@ -522,11 +533,7 @@ pub async fn run_forever(
                 Ok(x) => x,
                 Err(_) => continue,
             };
-            let active = g
-                .tasks
-                .iter()
-                .filter(|t| t.is_active_pipeline())
-                .count();
+            let active = g.tasks.iter().filter(|t| t.is_active_pipeline()).count();
             if active >= cap as usize {
                 continue;
             }
@@ -655,10 +662,7 @@ fn run_one_task(
             ts,
             root,
             task_id,
-            &format!(
-                "Whisper 模型未下载: {model_id}（{}）",
-                model_path.display()
-            ),
+            &format!("Whisper 模型未下载: {model_id}（{}）", model_path.display()),
         );
         let _ = fs::remove_dir_all(&tmp_root);
         return;
@@ -666,7 +670,13 @@ fn run_one_task(
 
     if job.whisper_cli_path.trim().is_empty() {
         if let Err(e) = whisper_runtime::ensure_managed_whisper_cli(&root.0, |_| {}) {
-            fail_task(app, ts, root, task_id, &format!("自动安装 Whisper CLI 失败: {e}"));
+            fail_task(
+                app,
+                ts,
+                root,
+                task_id,
+                &format!("自动安装 Whisper CLI 失败: {e}"),
+            );
             let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
@@ -679,6 +689,31 @@ fn run_one_task(
             let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
+    };
+
+    let vad_model_path = if job.whisper_enable_vad {
+        match whisper_runtime::ensure_managed_whisper_vad_model(
+            &root.0,
+            &cfg.whisper.mirror_url,
+            cfg.whisper.prefer_mirror,
+            &cfg.whisper.download_url,
+            |_| {},
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                fail_task(
+                    app,
+                    ts,
+                    root,
+                    task_id,
+                    &format!("准备 Whisper VAD 模型失败: {e}"),
+                );
+                let _ = fs::remove_dir_all(&tmp_root);
+                return;
+            }
+        }
+    } else {
+        None
     };
 
     let threads = effective_threads(job.cpu_thread_limit, cfg.runtime.cpu_thread_limit);
@@ -694,12 +729,26 @@ fn run_one_task(
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
             t.status = STATUS_TRANSCRIBING.into();
             t.progress = p_tr_start;
-            t.phase = "transcribe".into();
+            t.phase = if job.whisper_enable_vad {
+                "vad_detect".into()
+            } else {
+                "transcribe".into()
+            };
             t.updated_at_ms = now_ms();
             let _ = task_store::save_task_store_file(&root.0, &g);
         }
     }
-    emit_progress(app, task_id, STATUS_TRANSCRIBING, p_tr_start, "transcribe");
+    emit_progress(
+        app,
+        task_id,
+        STATUS_TRANSCRIBING,
+        p_tr_start,
+        if job.whisper_enable_vad {
+            "vad_detect"
+        } else {
+            "transcribe"
+        },
+    );
 
     match mid_run_poll(ts, task_id) {
         MidRun::Continue => {}
@@ -715,6 +764,14 @@ fn run_one_task(
         }
     }
 
+    let whisper_vad = vad_model_path.as_ref().map(|model_path| WhisperVadOptions {
+        model_path: model_path.as_path(),
+        threshold: job.vad_threshold,
+        min_speech_ms: job.vad_min_speech_ms,
+        min_silence_ms: job.vad_min_silence_ms,
+        max_segment_ms: job.vad_max_segment_ms,
+    });
+
     if let Err(e) = run_whisper_srt_json(
         &whisper_cli,
         &model_path,
@@ -723,6 +780,7 @@ fn run_one_task(
         threads,
         force_cpu,
         &w_prefix,
+        whisper_vad.as_ref(),
     ) {
         fail_task(app, ts, root, task_id, &e);
         let _ = fs::remove_dir_all(&tmp_root);
@@ -742,13 +800,12 @@ fn run_one_task(
         return;
     }
 
-    let lang_for_name = if rec_lang.trim().is_empty()
-        || rec_lang.trim().eq_ignore_ascii_case("auto")
-    {
-        read_language_from_whisper_json(&json_tmp, "und")
-    } else {
-        rec_lang.trim().to_string()
-    };
+    let lang_for_name =
+        if rec_lang.trim().is_empty() || rec_lang.trim().eq_ignore_ascii_case("auto") {
+            read_language_from_whisper_json(&json_tmp, "und")
+        } else {
+            rec_lang.trim().to_string()
+        };
 
     let srt_raw = match fs::read_to_string(&srt_tmp) {
         Ok(s) => s,
@@ -808,7 +865,13 @@ fn run_one_task(
         let seg_client = match reqwest::blocking::Client::builder().build() {
             Ok(c) => c,
             Err(e) => {
-                fail_task(app, ts, root, task_id, &format!("HTTP 客户端初始化失败: {e}"));
+                fail_task(
+                    app,
+                    ts,
+                    root,
+                    task_id,
+                    &format!("HTTP 客户端初始化失败: {e}"),
+                );
                 let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
@@ -885,10 +948,7 @@ fn run_one_task(
                 ts,
                 root,
                 task_id,
-                &format!(
-                    "目标字幕已存在且配置为不覆盖: {}",
-                    final_path.display()
-                ),
+                &format!("目标字幕已存在且配置为不覆盖: {}", final_path.display()),
             );
             let _ = fs::remove_dir_all(&tmp_root);
             return;
@@ -963,7 +1023,13 @@ fn run_one_task(
     }
 
     if job.subtitle_mode == "original_only" {
-        fail_task(app, ts, root, task_id, "内部错误：仅原文字幕任务不应进入翻译");
+        fail_task(
+            app,
+            ts,
+            root,
+            task_id,
+            "内部错误：仅原文字幕任务不应进入翻译",
+        );
         let _ = fs::remove_dir_all(&tmp_root);
         return;
     }
@@ -1099,13 +1165,7 @@ fn run_one_task(
             }
         }
         if let Err(e) = fs::write(po, format_srt(&cues)) {
-            fail_task(
-                app,
-                ts,
-                root,
-                task_id,
-                &format!("写入原文字幕失败: {e}"),
-            );
+            fail_task(app, ts, root, task_id, &format!("写入原文字幕失败: {e}"));
             let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
@@ -1169,7 +1229,13 @@ fn run_one_task(
     let client = match reqwest::blocking::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
-            fail_task(app, ts, root, task_id, &format!("HTTP 客户端初始化失败: {e}"));
+            fail_task(
+                app,
+                ts,
+                root,
+                task_id,
+                &format!("HTTP 客户端初始化失败: {e}"),
+            );
             let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
@@ -1254,7 +1320,13 @@ fn run_one_task(
                         let _ = task_store::save_task_store_file(&root_prog, &g);
                     }
                 }
-                emit_progress(&app_prog, &tid_prog, STATUS_TRANSLATING, p, "translate_google");
+                emit_progress(
+                    &app_prog,
+                    &tid_prog,
+                    STATUS_TRANSLATING,
+                    p,
+                    "translate_google",
+                );
             },
         )
         .map(|translated| (translated, false))
@@ -1323,13 +1395,8 @@ fn run_one_task(
                             .map(|cue| cue.text.clone())
                             .collect::<Vec<_>>(),
                     );
-                    let translated_preview = preview_text(
-                        &translated
-                            .iter()
-                            .take(2)
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    );
+                    let translated_preview =
+                        preview_text(&translated.iter().take(2).cloned().collect::<Vec<_>>());
                     cache_task_outputs(
                         ts,
                         root,

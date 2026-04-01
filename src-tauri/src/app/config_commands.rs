@@ -5,9 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tauri::State;
 
-use crate::domain::config::{
-    AppConfigView, LlmTestResult, SaveConfigRequest, TestLlmRequest,
-};
+use crate::domain::config::{AppConfigView, LlmTestResult, SaveConfigRequest, TestLlmRequest};
 use crate::domain::task::STATUS_PENDING;
 
 fn ok_llm_test(r: LlmTestResult) -> Result<LlmTestResult, String> {

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter};
@@ -70,6 +70,22 @@ fn occupies_runner_slot(status: &str) -> bool {
     matches!(status, STATUS_RUNNING | STATUS_PAUSE_REQUESTED)
 }
 
+fn lock_task_store<'a>(
+    ts: &'a Arc<Mutex<TaskStoreFile>>,
+    context: &str,
+) -> MutexGuard<'a, TaskStoreFile> {
+    match ts.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::error!(
+                target: "subforge_task",
+                "task_store_lock_poisoned context={context}; recovering poisoned mutex"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn update_task_runtime_state(
     ts: &Arc<Mutex<TaskStoreFile>>,
     root: &AppRoot,
@@ -80,10 +96,7 @@ fn update_task_runtime_state(
     progress: Option<u8>,
     phase: Option<&str>,
 ) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        Err(_) => return,
-    };
+    let mut g = lock_task_store(ts, "update_task_runtime_state");
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
         t.normalize_state();
         if let Some(status) = task_status {
@@ -129,10 +142,7 @@ where
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
-            let mut g = match ts_hb.lock() {
-                Ok(x) => x,
-                Err(_) => break,
-            };
+            let mut g = lock_task_store(&ts_hb, "run_with_progress_heartbeat");
             let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id_hb) else {
                 break;
             };
@@ -162,9 +172,7 @@ enum MidRun {
 }
 
 fn mid_run_poll(ts: &Arc<Mutex<TaskStoreFile>>, id: &str) -> MidRun {
-    let Ok(g) = ts.lock() else {
-        return MidRun::Cancel;
-    };
+    let g = lock_task_store(ts, "mid_run_poll");
     let Some(t) = g.tasks.iter().find(|x| x.id == id) else {
         return MidRun::Cancel;
     };
@@ -187,10 +195,7 @@ fn remove_task_if_present(
     root: &AppRoot,
     id: &str,
 ) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        _ => return,
-    };
+    let mut g = lock_task_store(ts, "remove_task_if_present");
     let before = g.tasks.len();
     g.tasks.retain(|t| t.id != id);
     if g.tasks.len() < before {
@@ -201,10 +206,7 @@ fn remove_task_if_present(
 }
 
 fn apply_paused(ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id: &str, app: &AppHandle) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        _ => return,
-    };
+    let mut g = lock_task_store(ts, "apply_paused");
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
         t.normalize_state();
         if t.status == STATUS_PAUSE_REQUESTED {
@@ -268,10 +270,7 @@ fn is_retryable_task_error(msg: &str) -> bool {
 }
 
 fn fail_task(app: &AppHandle, ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id: &str, msg: &str) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        _ => return,
-    };
+    let mut g = lock_task_store(ts, "fail_task");
     if !g.tasks.iter().any(|t| t.id == id) {
         return;
     }
@@ -370,7 +369,7 @@ struct JobSnapshot {
 }
 
 fn load_job(ts: &Arc<Mutex<TaskStoreFile>>, task_id: &str, cfg: &AppConfig) -> Option<JobSnapshot> {
-    let g = ts.lock().ok()?;
+    let g = lock_task_store(ts, "load_job");
     let t = g.tasks.iter().find(|x| x.id == task_id)?;
     let snap = !t.snapshot_whisper_model.trim().is_empty();
     let (output_dir_mode, custom_output_dir) = if snap && !t.snapshot_output_dir_mode.is_empty() {
@@ -547,10 +546,7 @@ fn succeed_task(
     id: &str,
     note: Option<String>,
 ) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        _ => return,
-    };
+    let mut g = lock_task_store(ts, "succeed_task");
     if !g.tasks.iter().any(|t| t.id == id) {
         return;
     }
@@ -584,10 +580,7 @@ fn cache_task_outputs(
     translated_output_path: Option<&Path>,
     bilingual_output_path: Option<&Path>,
 ) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        Err(_) => return,
-    };
+    let mut g = lock_task_store(ts, "cache_task_outputs");
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
         t.original_preview = original_preview;
         t.translated_preview = translated_preview;
@@ -605,10 +598,7 @@ fn cache_segmentation_note(
     id: &str,
     note: Option<String>,
 ) {
-    let mut g = match ts.lock() {
-        Ok(x) => x,
-        Err(_) => return,
-    };
+    let mut g = lock_task_store(ts, "cache_segmentation_note");
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
         t.segmentation_note = note;
         t.updated_at_ms = now_ms();
@@ -639,10 +629,7 @@ pub async fn run_forever(
         };
         let cap = effective_max_parallel_tasks(&cfg);
         let task_id = {
-            let mut g = match ts.lock() {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
+            let mut g = lock_task_store(&ts, "run_forever");
             let mut changed = false;
             for task in &mut g.tasks {
                 let old_status = task.status.clone();
@@ -859,10 +846,7 @@ fn run_one_task(
 
     let p_tr_start = if job.will_translate { 12u8 } else { 15u8 };
     {
-        let mut g = match ts.lock() {
-            Ok(x) => x,
-            Err(_) => return,
-        };
+        let mut g = lock_task_store(ts, "set_transcribing_state");
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
             t.normalize_state();
             t.status = STATUS_RUNNING.into();
@@ -1001,10 +985,7 @@ fn run_one_task(
     };
     if job.segmentation_strategy != "disabled" {
         {
-            let mut g = match ts.lock() {
-                Ok(x) => x,
-                Err(_) => return,
-            };
+            let mut g = lock_task_store(ts, "set_segmenting_state");
             if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
                 t.normalize_state();
                 t.status = STATUS_RUNNING.into();
@@ -1078,10 +1059,7 @@ fn run_one_task(
 
     let p_tr_done = if job.will_translate { 60u8 } else { 90u8 };
     {
-        let mut g = match ts.lock() {
-            Ok(x) => x,
-            Err(_) => return,
-        };
+        let mut g = lock_task_store(ts, "set_post_transcribe_progress");
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
             t.progress = p_tr_done;
             t.updated_at_ms = now_ms();
@@ -1117,10 +1095,7 @@ fn run_one_task(
             return;
         }
         {
-            let mut g = match ts.lock() {
-                Ok(x) => x,
-                Err(_) => return,
-            };
+            let mut g = lock_task_store(ts, "set_export_original_state");
             if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
                 t.normalize_state();
                 t.status = STATUS_RUNNING.into();
@@ -1332,7 +1307,17 @@ fn run_one_task(
     }
 
     if job.subtitle_mode == "dual_files" {
-        let po = dual_orig.as_ref().unwrap();
+        let Some(po) = dual_orig.as_ref() else {
+            fail_task(
+                app,
+                ts,
+                root,
+                task_id,
+                "Internal error: missing original subtitle output path for dual_files mode",
+            );
+            let _ = fs::remove_dir_all(&tmp_root);
+            return;
+        };
         update_task_runtime_state(
             ts,
             root,
@@ -1395,10 +1380,7 @@ fn run_one_task(
     }
 
     {
-        let mut g = match ts.lock() {
-            Ok(x) => x,
-            Err(_) => return,
-        };
+        let mut g = lock_task_store(ts, "set_translating_state");
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
             t.normalize_state();
             t.status = STATUS_RUNNING.into();
@@ -1475,12 +1457,11 @@ fn run_one_task(
                 } else {
                     (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
                 };
-                if let Ok(mut g) = ts_prog.lock() {
-                    if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
-                        tt.progress = p;
-                        tt.updated_at_ms = now_ms();
-                        let _ = task_store::save_task_store_file(&root_prog, &g);
-                    }
+                let mut g = lock_task_store(&ts_prog, "translate_llm_progress");
+                if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
+                    tt.progress = p;
+                    tt.updated_at_ms = now_ms();
+                    let _ = task_store::save_task_store_file(&root_prog, &g);
                 }
                 emit_progress(&app_prog, &tid_prog, STATUS_RUNNING, p, "translate_llm");
             },
@@ -1513,12 +1494,11 @@ fn run_one_task(
                 } else {
                     (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
                 };
-                if let Ok(mut g) = ts_prog.lock() {
-                    if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
-                        tt.progress = p;
-                        tt.updated_at_ms = now_ms();
-                        let _ = task_store::save_task_store_file(&root_prog, &g);
-                    }
+                let mut g = lock_task_store(&ts_prog, "translate_google_progress");
+                if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
+                    tt.progress = p;
+                    tt.updated_at_ms = now_ms();
+                    let _ = task_store::save_task_store_file(&root_prog, &g);
                 }
                 emit_progress(&app_prog, &tid_prog, STATUS_RUNNING, p, "translate_google");
             },
@@ -1529,10 +1509,7 @@ fn run_one_task(
     match translate_res {
         Ok((translated, any_fb)) => {
             {
-                let mut g = match ts.lock() {
-                    Ok(x) => x,
-                    Err(_) => return,
-                };
+                let mut g = lock_task_store(ts, "set_translation_export_state");
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
                     t.normalize_state();
                     t.status = STATUS_RUNNING.into();
@@ -1548,7 +1525,10 @@ fn run_one_task(
             let r_export = (|| -> Result<(), String> {
                 match job.subtitle_mode.as_str() {
                     "dual_files" => {
-                        let pb = dual_tgt.as_ref().unwrap();
+                        let pb = dual_tgt.as_ref().ok_or_else(|| {
+                            "Internal error: missing translated subtitle output path for dual_files mode"
+                                .to_string()
+                        })?;
                         if let Some(parent) = pb.parent() {
                             fs::create_dir_all(parent)
                                 .map_err(|e| format!("创建输出目录失败: {e}"))?;
@@ -1559,7 +1539,10 @@ fn run_one_task(
                             .map_err(|e| format!("写入译文字幕失败: {e}"))?;
                     }
                     "bilingual_single" => {
-                        let pb = bio_path.as_ref().unwrap();
+                        let pb = bio_path.as_ref().ok_or_else(|| {
+                            "Internal error: missing bilingual subtitle output path for bilingual_single mode"
+                                .to_string()
+                        })?;
                         if let Some(parent) = pb.parent() {
                             fs::create_dir_all(parent)
                                 .map_err(|e| format!("创建输出目录失败: {e}"))?;

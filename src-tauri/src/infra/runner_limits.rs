@@ -23,6 +23,22 @@ struct LlmSlotsInner {
     cvar: Condvar,
 }
 
+fn lock_active<'a>(
+    inner: &'a LlmSlotsInner,
+    context: &str,
+) -> std::sync::MutexGuard<'a, u32> {
+    match inner.active.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::error!(
+                target: "subforge_task",
+                "llm_slots_lock_poisoned context={context}; recovering poisoned mutex"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// 跨任务共享：限制同时在飞的 LLM 翻译 HTTP 请求数（见 `llm.translate_concurrency`）
 #[derive(Clone)]
 pub struct LlmRequestSlots {
@@ -41,9 +57,18 @@ impl LlmRequestSlots {
 
     pub fn acquire(&self, max_parallel: u32) -> LlmRequestPermit {
         let max = max_parallel.max(1).min(64);
-        let mut n = self.inner.active.lock().unwrap();
+        let mut n = lock_active(&self.inner, "acquire");
         while *n >= max {
-            n = self.inner.cvar.wait(n).unwrap();
+            n = match self.inner.cvar.wait(n) {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    log::error!(
+                        target: "subforge_task",
+                        "llm_slots_wait_poisoned context=acquire; recovering poisoned mutex"
+                    );
+                    poisoned.into_inner()
+                }
+            };
         }
         *n += 1;
         drop(n);
@@ -59,7 +84,7 @@ pub struct LlmRequestPermit {
 
 impl Drop for LlmRequestPermit {
     fn drop(&mut self) {
-        let mut n = self.inner.active.lock().unwrap();
+        let mut n = lock_active(&self.inner, "drop");
         *n = n.saturating_sub(1);
         self.inner.cvar.notify_one();
     }

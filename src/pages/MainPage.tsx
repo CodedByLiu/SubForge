@@ -23,11 +23,18 @@ function formatSize(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const S_START = ["pending", "paused", "failed"];
-const S_PAUSE = ["queued", "running"];
+const STARTABLE_STATUSES = ["pending", "paused", "failed", "pause_requested"];
+const PAUSABLE_STATUSES = ["queued", "running"];
+const RESUMABLE_STATUSES = ["paused", "pause_requested"];
 
 function pipelineActiveStatus(status: string): boolean {
   return ["queued", "running", "pause_requested"].includes(status);
+}
+
+function taskActionLabel(task: TaskRowDto): string {
+  if (task.status === "paused" || task.status === "pause_requested") return "继续";
+  if (task.status === "failed") return "重试";
+  return "开始";
 }
 
 export function MainPage() {
@@ -39,8 +46,8 @@ export function MainPage() {
   const refresh = useCallback(async () => {
     setLoadErr(null);
     try {
-      const p = await listTasks();
-      setPanel(p);
+      const next = await listTasks();
+      setPanel(next);
     } catch (e) {
       setLoadErr(String(e));
     }
@@ -73,6 +80,19 @@ export function MainPage() {
     window.setTimeout(() => setToast(null), 4500);
   };
 
+  const run = async (fn: () => Promise<unknown>, okMsg?: string) => {
+    setBusy(true);
+    try {
+      await fn();
+      if (okMsg) showToast(okMsg);
+      await refresh();
+    } catch (e) {
+      showToast(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onImport = async () => {
     const selected = await open({
       multiple: true,
@@ -86,12 +106,13 @@ export function MainPage() {
     if (selected === null) return;
     const paths = Array.isArray(selected) ? selected : [selected];
     if (paths.length === 0) return;
+
     setBusy(true);
     try {
-      const r = await importVideos(paths);
-      const parts = [`新增 ${r.added} 个`];
-      if (r.skipped_duplicates) parts.push(`重复 ${r.skipped_duplicates}`);
-      if (r.skipped_invalid) parts.push(`无效 ${r.skipped_invalid}`);
+      const result = await importVideos(paths);
+      const parts = [`新增 ${result.added}`];
+      if (result.skipped_duplicates) parts.push(`重复 ${result.skipped_duplicates}`);
+      if (result.skipped_invalid) parts.push(`无效 ${result.skipped_invalid}`);
       showToast(parts.join("，"));
       await refresh();
     } catch (e) {
@@ -104,6 +125,7 @@ export function MainPage() {
   const onBrowseOutput = async () => {
     const dir = await open({ directory: true });
     if (dir === null || typeof dir !== "string") return;
+
     setBusy(true);
     try {
       await setPanelOutput({
@@ -134,10 +156,12 @@ export function MainPage() {
       }
       return;
     }
+
     if (!panel?.custom_output_dir?.trim()) {
       await onBrowseOutput();
       return;
     }
+
     setBusy(true);
     try {
       await setPanelOutput({
@@ -154,25 +178,23 @@ export function MainPage() {
 
   const onClear = async () => {
     if (!panel || panel.tasks.length === 0) return;
+
     let force = false;
     if (panel.has_active_pipeline) {
-      const ok = await confirm("存在执行中的任务（提取/识别/翻译），确定要清空列表吗？", {
+      const ok = await confirm("存在执行中或排队中的任务，确认清空整个任务列表吗？", {
         title: "SubForge",
         kind: "warning",
       });
-      if (!ok) {
-        return;
-      }
+      if (!ok) return;
       force = true;
     } else {
-      const ok = await confirm("确定清空当前任务列表？", {
+      const ok = await confirm("确定清空当前任务列表吗？", {
         title: "SubForge",
         kind: "warning",
       });
-      if (!ok) {
-        return;
-      }
+      if (!ok) return;
     }
+
     setBusy(true);
     try {
       await clearTasks(force);
@@ -184,23 +206,18 @@ export function MainPage() {
     }
   };
 
-  const run = async (fn: () => Promise<unknown>, okMsg?: string) => {
-    setBusy(true);
-    try {
-      await fn();
-      if (okMsg) showToast(okMsg);
-      await refresh();
-    } catch (e) {
-      showToast(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const canStart = (t: TaskRowDto) => S_START.includes(t.status);
-  const canPause = (t: TaskRowDto) => S_PAUSE.includes(t.status);
-
-  const showTransCol = panel ? panel.show_translate_column : true;
+  const canStart = (task: TaskRowDto) => STARTABLE_STATUSES.includes(task.status);
+  const canPause = (task: TaskRowDto) => PAUSABLE_STATUSES.includes(task.status);
+  const showTranslateColumn = panel ? panel.show_translate_column : true;
+  const hasTasks = Boolean(panel?.tasks.length);
+  const hasAnyRunningLike = Boolean(
+    panel?.tasks.some((task) => PAUSABLE_STATUSES.includes(task.status)),
+  );
+  const hasAnyResumable = Boolean(
+    panel?.tasks.some((task) => RESUMABLE_STATUSES.includes(task.status)),
+  );
+  const canPauseAll = hasTasks && hasAnyRunningLike;
+  const canContinueAll = hasTasks && hasAnyResumable;
 
   return (
     <div className="main-page">
@@ -211,6 +228,7 @@ export function MainPage() {
             配置
           </Link>
         </div>
+
         <div className="main-toolbar-row wrap">
           <label className="inline-field">
             <span className="muted">输出目录</span>
@@ -218,34 +236,31 @@ export function MainPage() {
               disabled={busy}
               value={panel?.output_dir_mode ?? "video_dir"}
               onChange={(e) => {
-                const v = e.target.value as "video_dir" | "custom";
-                void onOutputModeChange(v);
+                const next = e.target.value as "video_dir" | "custom";
+                void onOutputModeChange(next);
               }}
             >
-              <option value="video_dir">视频同目录（各文件输出到其所在文件夹）</option>
+              <option value="video_dir">视频同目录（输出到视频所在文件夹）</option>
               <option value="custom">统一输出目录</option>
             </select>
           </label>
-          {panel?.output_dir_mode === "custom" && (
+          {panel?.output_dir_mode === "custom" ? (
             <>
               <span className="path-preview muted" title={panel.custom_output_dir}>
                 {panel.custom_output_dir || "未选择"}
               </span>
               <button type="button" disabled={busy} onClick={() => void onBrowseOutput()}>
-                浏览…
+                浏览
               </button>
             </>
-          )}
+          ) : null}
         </div>
+
         <div className="main-toolbar-row wrap">
           <button type="button" disabled={busy} onClick={() => void onImport()}>
             导入
           </button>
-          <button
-            type="button"
-            disabled={busy || !panel?.tasks.length}
-            onClick={() => void onClear()}
-          >
+          <button type="button" disabled={busy || !panel?.tasks.length} onClick={() => void onClear()}>
             清除
           </button>
           <button
@@ -256,9 +271,9 @@ export function MainPage() {
               void (async () => {
                 setBusy(true);
                 try {
-                  const n = await startTasks();
+                  const count = await startTasks();
                   await refresh();
-                  if (n > 0) showToast(`已将 ${n} 个任务设为排队`);
+                  if (count > 0) showToast(`已将 ${count} 个任务设为排队`);
                 } catch (e) {
                   showToast(String(e));
                 } finally {
@@ -271,14 +286,14 @@ export function MainPage() {
           </button>
           <button
             type="button"
-            disabled={busy || !panel?.tasks.length}
+            disabled={busy || !canPauseAll}
             onClick={() => void run(() => pauseAllTasks())}
           >
             暂停全部
           </button>
           <button
             type="button"
-            disabled={busy || !panel?.tasks.length}
+            disabled={busy || !canContinueAll}
             onClick={() => void run(() => continueAllTasks())}
           >
             继续全部
@@ -293,11 +308,11 @@ export function MainPage() {
         </div>
       </header>
 
-      {loadErr && <div className="test-result err">{loadErr}</div>}
-      {toast && <div className="test-result ok">{toast}</div>}
+      {loadErr ? <div className="test-result err">{loadErr}</div> : null}
+      {toast ? <div className="test-result ok">{toast}</div> : null}
       {panel === null && !loadErr ? (
         <p className="muted" style={{ margin: "0 0 0.65rem" }}>
-          正在加载任务列表…
+          正在加载任务列表...
         </p>
       ) : null}
 
@@ -307,7 +322,7 @@ export function MainPage() {
             <tr>
               <th>视频文件</th>
               <th>原字幕 / 状态</th>
-              {showTransCol ? <th>翻译 / 状态</th> : null}
+              {showTranslateColumn ? <th>翻译 / 状态</th> : null}
               <th>进度</th>
               <th>操作</th>
             </tr>
@@ -315,71 +330,73 @@ export function MainPage() {
           <tbody>
             {!panel?.tasks.length ? (
               <tr>
-                <td colSpan={showTransCol ? 5 : 4} className="muted">
-                  暂无任务，点击工具栏「导入」添加视频；输出目录可在上方选择「视频同目录」或「统一输出目录」。
+                <td colSpan={showTranslateColumn ? 5 : 4} className="muted">
+                  暂无任务，点击工具栏“导入”添加视频；输出目录可在上方选择“视频同目录”或“统一输出目录”。
                 </td>
               </tr>
             ) : (
-              panel.tasks.map((t) => (
-                <tr key={t.id}>
+              panel.tasks.map((task) => (
+                <tr key={task.id}>
                   <td>
-                    <div className="cell-name">{t.file_name}</div>
-                    <div className="cell-meta muted">
-                      {formatSize(t.file_size)}
-                    </div>
-                    {t.snapshot_summary ? (
-                      <div className="cell-meta muted" title={t.snapshot_summary}>
-                        {t.snapshot_summary}
+                    <div className="cell-name">{task.file_name}</div>
+                    <div className="cell-meta muted">{formatSize(task.file_size)}</div>
+                    {task.snapshot_summary ? (
+                      <div className="cell-meta muted" title={task.snapshot_summary}>
+                        {task.snapshot_summary}
                       </div>
                     ) : null}
                   </td>
+
                   <td>
-                    <div>{t.original_status_display}</div>
-                    {t.original_preview ? (
-                      <div className="cell-meta" title={t.original_preview}>
-                        {t.original_preview}
+                    <div>{task.original_status_display}</div>
+                    {task.original_preview ? (
+                      <div className="cell-meta" title={task.original_preview}>
+                        {task.original_preview}
                       </div>
                     ) : null}
-                    {t.status === "failed" && t.error_message ? (
-                      <div className="cell-error" title={t.error_message}>
-                        {t.error_message.length > 220
-                          ? `${t.error_message.slice(0, 220)}…`
-                          : t.error_message}
+                    {task.status === "failed" && task.error_message ? (
+                      <div className="cell-error" title={task.error_message}>
+                        {task.error_message.length > 220
+                          ? `${task.error_message.slice(0, 220)}...`
+                          : task.error_message}
                       </div>
                     ) : null}
                   </td>
-                  {showTransCol ? (
+
+                  {showTranslateColumn ? (
                     <td>
-                      <div>{t.will_translate ? t.translate_status_display : "-"}</div>
-                      {t.will_translate && t.translated_preview ? (
-                        <div className="cell-meta" title={t.translated_preview}>
-                          {t.translated_preview}
+                      <div>{task.will_translate ? task.translate_status_display : "-"}</div>
+                      {task.will_translate && task.translated_preview ? (
+                        <div className="cell-meta" title={task.translated_preview}>
+                          {task.translated_preview}
                         </div>
                       ) : null}
                     </td>
                   ) : null}
+
                   <td>
-                    {t.status === "failed" || t.status === "completed"
-                      ? t.status === "completed"
+                    {task.status === "failed" || task.status === "completed"
+                      ? task.status === "completed"
                         ? "100%"
-                        : "—"
-                      : `${t.progress}%${t.phase ? ` · ${t.phase}` : ""}`}
-                    {t.retry_attempts > 0 ? (
-                      <div className="cell-meta muted">Retry {t.retry_attempts}</div>
+                        : "-"
+                      : `${task.progress}%${task.phase ? ` · ${task.phase}` : ""}`}
+                    {task.retry_attempts > 0 ? (
+                      <div className="cell-meta muted">Retry {task.retry_attempts}</div>
                     ) : null}
                   </td>
+
                   <td className="cell-actions">
                     <button
                       type="button"
-                      disabled={busy || !canStart(t)}
-                      onClick={() => void run(() => startTask(t.id))}
+                      disabled={busy || !canStart(task)}
+                      onClick={() => void run(() => startTask(task.id))}
                     >
-                      开始
+                      {taskActionLabel(task)}
                     </button>
                     <button
                       type="button"
-                      disabled={busy || !canPause(t)}
-                      onClick={() => void run(() => pauseTask(t.id))}
+                      disabled={busy || !canPause(task)}
+                      onClick={() => void run(() => pauseTask(task.id))}
                     >
                       暂停
                     </button>
@@ -388,16 +405,16 @@ export function MainPage() {
                       disabled={busy}
                       onClick={() => {
                         void (async () => {
-                        const active = pipelineActiveStatus(t.status);
-                        const msg = active
-                          ? `任务「${t.file_name}」正在执行或排队中，删除将请求安全取消并从列表移除，确定？`
-                          : `删除任务「${t.file_name}」？`;
-                        const ok = await confirm(msg, {
-                          title: "SubForge",
-                          kind: "warning",
-                        });
-                        if (!ok) return;
-                        void run(() => deleteTask(t.id));
+                          const active = pipelineActiveStatus(task.status);
+                          const msg = active
+                            ? `任务“${task.file_name}”正在执行或排队中，删除将请求安全取消并从列表移除，确定吗？`
+                            : `删除任务“${task.file_name}”？`;
+                          const ok = await confirm(msg, {
+                            title: "SubForge",
+                            kind: "warning",
+                          });
+                          if (!ok) return;
+                          void run(() => deleteTask(task.id));
                         })();
                       }}
                     >

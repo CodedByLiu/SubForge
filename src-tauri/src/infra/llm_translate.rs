@@ -1,4 +1,5 @@
-//! LLM 分批翻译：JSON 对齐校验、重试、减半、逐条回退原文
+//! LLM batch translation with JSON alignment validation, retries, splitting,
+//! and per-item fallback to source text.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -18,6 +19,19 @@ struct LlmSeg {
     text: String,
 }
 
+enum BatchParse {
+    Complete(Vec<String>),
+    Partial {
+        found: Vec<(u32, String)>,
+        missing: Vec<u32>,
+    },
+}
+
+struct PartialBatchAttempt {
+    found: Vec<(usize, String)>,
+    missing: Vec<usize>,
+}
+
 pub struct TranslateJob<'a> {
     pub base_url: &'a str,
     pub model: &'a str,
@@ -35,9 +49,40 @@ pub struct TranslateJob<'a> {
 
 fn style_instruction(style: &str) -> &'static str {
     match style {
-        "literal" => "采用直译，尽量保持原句结构与语序。",
-        "natural" => "采用自然、口语化的目标语言表达，可读性优先。",
-        _ => "术语表中的词若出现，译文必须使用术语表给定译法；其余内容准确翻译。",
+        "literal" => {
+            "Use a literal translation style. Preserve wording, syntax, and sentence structure when possible."
+        }
+        "natural" => {
+            "Use a natural spoken style in the target language, but do not omit important meaning."
+        }
+        _ => {
+            "Use a technical tutorial translation style. Prioritize terminology consistency, information completeness, and instructional clarity over brevity."
+        }
+    }
+}
+
+fn fidelity_instruction(style: &str) -> &'static str {
+    match style {
+        "natural" => {
+            "Keep the translation fluent, but do not summarize, soften, or skip technical details."
+        }
+        "literal" => {
+            "Do not rewrite into a summary. Keep the full meaning of every subtitle item."
+        }
+        _ => {
+            "Do not simplify into a summary. Preserve technical details, qualifiers, relationships, and step-by-step explanations. If the source mentions classes, methods, variables, file names, UI labels, or code terms, keep them accurate and stable across items."
+        }
+    }
+}
+
+fn identifier_instruction(style: &str) -> &'static str {
+    match style {
+        "natural" => {
+            "For code identifiers and product names, prefer preserving the original spelling when translation would reduce precision."
+        }
+        _ => {
+            "Preserve code identifiers, API names, class names, method names, variable names, and file names exactly when appropriate. Do not replace precise technical terms with vague Chinese paraphrases."
+        }
     }
 }
 
@@ -45,19 +90,17 @@ fn glossary_block(entries: &[GlossaryEntry], case_sensitive: bool) -> String {
     if entries.is_empty() {
         return String::new();
     }
-    let mut s = String::from("术语表规则：整词匹配");
-    s.push_str(if case_sensitive {
-        "（区分大小写）。"
+    let mut s = if case_sensitive {
+        String::from("Glossary rules: match whole words, case-sensitive.\n")
     } else {
-        "（不区分大小写）。"
-    });
-    s.push_str("下列术语在原文中以完整词出现时，译文须使用对应译法：\n");
+        String::from("Glossary rules: match whole words, case-insensitive.\n")
+    };
     for e in entries {
         if e.source.trim().is_empty() {
             continue;
         }
         s.push_str(&format!(
-            "- \"{}\" → \"{}\"\n",
+            "- \"{}\" -> \"{}\"\n",
             e.source.trim(),
             e.target.trim()
         ));
@@ -87,41 +130,69 @@ fn strip_json_fence(s: &str) -> String {
     t.to_string()
 }
 
-fn parse_batch_json(content: &str, expected_ids: &[u32]) -> Result<Vec<String>, String> {
+fn parse_segments(content: &str) -> Result<Vec<LlmSeg>, String> {
     let cleaned = strip_json_fence(content);
-    let items: Vec<LlmSeg> = serde_json::from_str(&cleaned).map_err(|e| {
+    serde_json::from_str(&cleaned).map_err(|e| {
         format!(
-            "JSON 解析失败: {e}；片段: {}",
+            "JSON parse failed: {e}; snippet: {}",
             cleaned.chars().take(200).collect::<String>()
         )
-    })?;
-    if items.len() != expected_ids.len() {
-        return Err(format!(
-            "返回 {} 条，期望 {} 条",
-            items.len(),
+    })
+}
+
+#[cfg(test)]
+fn parse_batch_json(content: &str, expected_ids: &[u32]) -> Result<Vec<String>, String> {
+    match parse_batch_partial(content, expected_ids)? {
+        BatchParse::Complete(items) => Ok(items),
+        BatchParse::Partial { found, missing } => Err(format!(
+            "Returned {} items, expected {}; missing ids={missing:?}",
+            found.len(),
             expected_ids.len()
-        ));
+        )),
     }
+}
+
+fn parse_batch_partial(content: &str, expected_ids: &[u32]) -> Result<BatchParse, String> {
+    let items = parse_segments(content)?;
     let mut map: HashMap<u32, String> = HashMap::new();
     for it in items {
-        map.insert(it.id as u32, it.text);
+        if map.insert(it.id as u32, it.text).is_some() {
+            return Err("Duplicate id in JSON response".into());
+        }
     }
-    if map.len() != expected_ids.len() {
-        return Err("返回 JSON 中存在重复 id".into());
+
+    let expected_lookup: HashMap<u32, usize> = expected_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, id)| (id, idx))
+        .collect();
+    let unexpected: Vec<u32> = map
+        .keys()
+        .copied()
+        .filter(|id| !expected_lookup.contains_key(id))
+        .collect();
+    if !unexpected.is_empty() {
+        return Err(format!("Unexpected ids in JSON response: {unexpected:?}"));
     }
-    let mut exp_sorted = expected_ids.to_vec();
-    exp_sorted.sort_unstable();
-    let mut got: Vec<u32> = map.keys().copied().collect();
-    got.sort_unstable();
-    if got != exp_sorted {
-        return Err(format!("编号集合不匹配: 期望 {exp_sorted:?} 得到 {got:?}"));
-    }
-    let mut ordered = Vec::with_capacity(expected_ids.len());
+
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
     for id in expected_ids {
-        let t = map.remove(id).ok_or_else(|| format!("缺少 id={id}"))?;
-        ordered.push(t);
+        if let Some(text) = map.remove(id) {
+            found.push((*id, text));
+        } else {
+            missing.push(*id);
+        }
     }
-    Ok(ordered)
+
+    if missing.is_empty() {
+        return Ok(BatchParse::Complete(
+            found.into_iter().map(|(_, text)| text).collect(),
+        ));
+    }
+
+    Ok(BatchParse::Partial { found, missing })
 }
 
 fn extract_content(resp_json: &Value) -> Result<String, String> {
@@ -129,7 +200,7 @@ fn extract_content(resp_json: &Value) -> Result<String, String> {
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "响应缺少 choices[0].message.content".into())
+        .ok_or_else(|| "Response missing choices[0].message.content".into())
 }
 
 fn call_chat(
@@ -157,7 +228,7 @@ fn call_chat(
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .map_err(|e| format!("网络请求失败: {e}"))?;
+        .map_err(|e| format!("Network request failed: {e}"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -167,7 +238,7 @@ fn call_chat(
             text.chars().take(500).collect::<String>()
         ));
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("响应非 JSON: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("Response is not JSON: {e}"))?;
     extract_content(&v)
 }
 
@@ -202,11 +273,12 @@ fn translate_indices_once(
     sleep_before: bool,
     llm_slots: Option<&LlmRequestSlots>,
     llm_cap: u32,
-) -> Result<Vec<String>, String> {
+) -> Result<BatchParse, String> {
     if sleep_before && job.min_interval_ms > 0 {
         std::thread::sleep(Duration::from_millis(job.min_interval_ms));
     }
     let _llm_permit = llm_slots.map(|s| s.acquire(llm_cap));
+
     let ids: Vec<u32> = indices.iter().map(|&i| cues[i].index).collect();
     let payload: Vec<Value> = indices
         .iter()
@@ -217,36 +289,47 @@ fn translate_indices_once(
             })
         })
         .collect();
+
     let sys = format!(
-        "你是字幕翻译助手。只输出 JSON 数组，不要 Markdown、不要解释。\n\
-         目标语言代码: {}\n\
-         源语言参考: {}\n\
-         {}\n\
-         {}\n\
-         {}",
+        "You are a subtitle translation assistant. Output JSON only, no markdown, no explanation.\n\
+Target language code: {}\n\
+Source language hint: {}\n\
+{}\n\
+{}\n\
+{}\n\
+{}\n\
+{}",
         job.target_lang,
         job.source_lang,
         style_instruction(job.style),
+        fidelity_instruction(job.style),
+        identifier_instruction(job.style),
         if job.keep_proper_nouns {
-            "保留人名、作品名等专有名词时可保留原文或通用译名，不要臆造。"
+            "Preserve proper nouns when appropriate."
         } else {
             ""
         },
         glossary_block(job.glossary, job.glossary_case_sensitive)
     );
+
     let mut user = String::from(
-        "将下列字幕逐条翻译为目标语言。输出格式：JSON 数组，元素为 {\"id\":序号,\"text\":\"译文\"}，\
-必须与输入条数、id 完全一致。\n输入：\n",
+        "Translate each subtitle item into the target language.\n\
+Return a JSON array where each item is {\"id\": number, \"text\": \"translation\"}.\n\
+The number of items and every id must match the input exactly.\n\
+Translate each item faithfully. Do not omit information just to make it shorter.\n\
+Do not merge explanation into a vague summary. Keep the original instructional intent.\n\
+Input:\n",
     );
     user.push_str(&serde_json::to_string(&payload).map_err(|e| e.to_string())?);
     if let Some(ctx) = context_hint.filter(|s| !s.trim().is_empty()) {
-        user.push_str("\n\n前文参考（仅连贯语气，不要翻译本字段）：\n");
+        user.push_str("\n\nPrevious translated context for tone only:\n");
         user.push_str(ctx);
     }
+
     let url = chat_completions_url(job.base_url);
     let timeout = Duration::from_secs(job.timeout_sec.max(5));
     let content = call_chat(client, &url, job.api_key, job.model, &sys, &user, timeout)?;
-    parse_batch_json(&content, &ids)
+    parse_batch_partial(&content, &ids)
 }
 
 fn translate_indices_recursive(
@@ -262,6 +345,7 @@ fn translate_indices_recursive(
     if indices.is_empty() {
         return (Vec::new(), false);
     }
+
     if indices.len() == 1 {
         let i = indices[0];
         let orig = cues[i].text.clone();
@@ -276,70 +360,137 @@ fn translate_indices_recursive(
                 llm_slots,
                 llm_cap,
             ) {
-                Ok(v) if v.len() == 1 => {
+                Ok(BatchParse::Complete(v)) if v.len() == 1 => {
                     *sleep_next = true;
                     return (v, false);
+                }
+                Ok(BatchParse::Partial { .. }) => {}
+                Err(e) => {
+                    log::warn!("Translation batch failed: {e}");
                 }
                 _ => {}
             }
             *sleep_next = true;
         }
-        (vec![orig], true)
-    } else {
-        for _attempt in 0..=job.max_retries_per_batch {
-            match translate_indices_once(
-                client,
-                job,
-                cues,
-                indices,
-                context_hint,
-                *sleep_next,
-                llm_slots,
-                llm_cap,
-            ) {
-                Ok(v) if v.len() == indices.len() => {
-                    *sleep_next = true;
-                    return (v, false);
-                }
-                Ok(v) => {
-                    log::warn!("翻译批次条数异常: 期望 {} 得到 {}", indices.len(), v.len());
-                }
-                Err(e) => {
-                    log::warn!("翻译批次失败: {e}");
+        return (vec![orig], true);
+    }
+
+    let mut best_partial: Option<PartialBatchAttempt> = None;
+    for _attempt in 0..=job.max_retries_per_batch {
+        match translate_indices_once(
+            client,
+            job,
+            cues,
+            indices,
+            context_hint,
+            *sleep_next,
+            llm_slots,
+            llm_cap,
+        ) {
+            Ok(BatchParse::Complete(v)) if v.len() == indices.len() => {
+                *sleep_next = true;
+                return (v, false);
+            }
+            Ok(BatchParse::Partial { found, missing }) => {
+                log::warn!(
+                    "Translation batch returned partial result: {} / {}, missing ids={missing:?}",
+                    found.len(),
+                    indices.len()
+                );
+                let found_lookup: HashMap<u32, usize> = indices
+                    .iter()
+                    .map(|&idx| (cues[idx].index, idx))
+                    .collect();
+                let found_indices: Vec<(usize, String)> = found
+                    .into_iter()
+                    .filter_map(|(id, text)| found_lookup.get(&id).copied().map(|idx| (idx, text)))
+                    .collect();
+                let missing_indices: Vec<usize> = missing
+                    .into_iter()
+                    .filter_map(|id| found_lookup.get(&id).copied())
+                    .collect();
+                if !found_indices.is_empty()
+                    && best_partial
+                        .as_ref()
+                        .map(|best| found_indices.len() > best.found.len())
+                        .unwrap_or(true)
+                {
+                    best_partial = Some(PartialBatchAttempt {
+                        found: found_indices,
+                        missing: missing_indices,
+                    });
                 }
             }
-            *sleep_next = true;
+            Err(e) => {
+                log::warn!("Translation batch failed: {e}");
+            }
+            _ => {}
         }
-        let mid = indices.len() / 2;
-        let (left, fb1) = translate_indices_recursive(
-            client,
-            job,
-            cues,
-            &indices[..mid],
-            context_hint,
-            sleep_next,
-            llm_slots,
-            llm_cap,
-        );
-        let tail = left.last().map(|s| s.as_str());
-        let (right, fb2) = translate_indices_recursive(
-            client,
-            job,
-            cues,
-            &indices[mid..],
-            tail,
-            sleep_next,
-            llm_slots,
-            llm_cap,
-        );
-        let mut out = left;
-        out.extend(right);
-        (out, fb1 || fb2)
+        *sleep_next = true;
     }
+
+    if let Some(best) = best_partial {
+        let hint_text_owned = best
+            .found
+            .iter()
+            .max_by_key(|(idx, _)| *idx)
+            .map(|(_, text)| text.clone());
+        let mut found_map: HashMap<usize, String> = best.found.into_iter().collect();
+        let hint_text = hint_text_owned.as_deref().or(context_hint);
+        let (repaired, fb) = translate_indices_recursive(
+            client,
+            job,
+            cues,
+            &best.missing,
+            hint_text,
+            sleep_next,
+            llm_slots,
+            llm_cap,
+        );
+        for (idx, text) in best.missing.iter().copied().zip(repaired.into_iter()) {
+            found_map.insert(idx, text);
+        }
+        let mut merged = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if let Some(text) = found_map.remove(idx) {
+                merged.push(text);
+            } else {
+                merged.push(cues[*idx].text.clone());
+            }
+        }
+        return (merged, fb);
+    }
+
+    let mid = indices.len() / 2;
+    let (left, fb1) = translate_indices_recursive(
+        client,
+        job,
+        cues,
+        &indices[..mid],
+        context_hint,
+        sleep_next,
+        llm_slots,
+        llm_cap,
+    );
+    let tail = left.last().map(|s| s.as_str());
+    let (right, fb2) = translate_indices_recursive(
+        client,
+        job,
+        cues,
+        &indices[mid..],
+        tail,
+        sleep_next,
+        llm_slots,
+        llm_cap,
+    );
+    let mut out = left;
+    out.extend(right);
+    (out, fb1 || fb2)
 }
 
-/// 返回与 `cues` 等长的译文；`any_fallback` 表示存在逐条回退原文。  
-/// `pause_requested` 在批次间隙调用，返回 `true` 时中止并返回 `Err("__pause__")`。
+/// Returns translations with the same length as `cues`.
+/// `any_fallback` is true if some items finally fell back to source text.
+/// If `pause_requested` returns true between batches, returns `Err("__pause__")`.
 pub fn translate_all_cues(
     client: &Client,
     job: &TranslateJob,
@@ -354,20 +505,22 @@ pub fn translate_all_cues(
         return Ok((Vec::new(), false));
     }
     if job.base_url.trim().is_empty() {
-        return Err("LLM Base URL 为空".into());
+        return Err("LLM Base URL is empty".into());
     }
     if job.model.trim().is_empty() {
-        return Err("LLM 模型名为空".into());
+        return Err("LLM model is empty".into());
     }
     if job.api_key.trim().is_empty() {
-        return Err("未配置 LLM API Key".into());
+        return Err("LLM API Key is not configured".into());
     }
+
     let batches = build_batches(cues, max_segment_chars);
     let mut out = vec![String::new(); cues.len()];
     let mut any_fb = false;
     let mut done = 0usize;
     let mut sleep_next = false;
     let mut last_tail: Option<String> = None;
+
     for batch in batches {
         if pause_requested() {
             return Err("__pause__".into());
@@ -391,6 +544,7 @@ pub fn translate_all_cues(
         last_tail = batch.last().map(|&i| out[i].clone());
         on_progress(done, cues.len());
     }
+
     Ok((out, any_fb))
 }
 
@@ -398,7 +552,7 @@ pub fn translate_all_cues(
 mod tests {
     use crate::infra::srt::SubCue;
 
-    use super::{build_batches, parse_batch_json};
+    use super::{build_batches, parse_batch_json, parse_batch_partial, BatchParse};
 
     #[test]
     fn parse_batch_json_accepts_expected_payload() {
@@ -413,7 +567,7 @@ mod tests {
     #[test]
     fn parse_batch_json_rejects_wrong_count() {
         let err = parse_batch_json(r#"[{"id":1,"text":"你好"}]"#, &[1, 2]).unwrap_err();
-        assert!(err.contains("期望"));
+        assert!(err.contains("expected"));
     }
 
     #[test]
@@ -423,7 +577,19 @@ mod tests {
             &[1, 2],
         )
         .unwrap_err();
-        assert!(err.contains("id"));
+        assert!(err.contains("Duplicate"));
+    }
+
+    #[test]
+    fn parse_batch_partial_accepts_missing_items() {
+        let parsed = parse_batch_partial(r#"[{"id":1,"text":"你好"}]"#, &[1, 2]).unwrap();
+        match parsed {
+            BatchParse::Partial { found, missing } => {
+                assert_eq!(found, vec![(1, "你好".to_string())]);
+                assert_eq!(missing, vec![2]);
+            }
+            BatchParse::Complete(_) => panic!("expected partial"),
+        }
     }
 
     #[test]

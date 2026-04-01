@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +25,10 @@ use crate::infra::llm_translate::{translate_all_cues, TranslateJob};
 use crate::infra::paths::temp_dir;
 use crate::infra::runner_limits::{effective_max_parallel_tasks, LlmRequestSlots};
 use crate::infra::secrets;
-use crate::infra::srt::{build_bilingual_cues, format_srt, parse_srt, SubCue};
+use crate::infra::srt::{
+    build_bilingual_cues_optimized, build_translated_cues, format_srt, optimize_source_cues,
+    optimize_translated_cues, parse_srt,
+};
 use crate::infra::subtitle_output::{resolve_bilingual_srt_path, resolve_original_srt_path};
 use crate::infra::subtitle_segmentation::{segment_cues, SegmentationJob};
 use crate::infra::task_store;
@@ -62,6 +66,10 @@ fn emit_progress(app: &AppHandle, task_id: &str, status: &str, progress: u8, pha
     );
 }
 
+fn occupies_runner_slot(status: &str) -> bool {
+    matches!(status, STATUS_RUNNING | STATUS_PAUSE_REQUESTED)
+}
+
 fn update_task_runtime_state(
     ts: &Arc<Mutex<TaskStoreFile>>,
     root: &AppRoot,
@@ -96,6 +104,54 @@ fn update_task_runtime_state(
         t.updated_at_ms = now_ms();
         let _ = task_store::save_task_store_file(&root.0, &g);
     }
+}
+
+fn run_with_progress_heartbeat<T, F>(
+    ts: &Arc<Mutex<TaskStoreFile>>,
+    root: &AppRoot,
+    task_id: &str,
+    phase: &str,
+    max_progress: u8,
+    action: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let ts_hb = ts.clone();
+    let root_hb = root.clone();
+    let task_id_hb = task_id.to_string();
+    let phase_hb = phase.to_string();
+    let handle = std::thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(1500));
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut g = match ts_hb.lock() {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id_hb) else {
+                break;
+            };
+            if t.progress >= max_progress {
+                continue;
+            }
+            if t.phase.is_empty() {
+                t.phase = phase_hb.clone();
+            }
+            t.progress = (t.progress + 1).min(max_progress);
+            t.updated_at_ms = now_ms();
+            let _ = task_store::save_task_store_file(&root_hb.0, &g);
+        }
+    });
+
+    let result = action();
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -587,7 +643,27 @@ pub async fn run_forever(
                 Ok(x) => x,
                 Err(_) => continue,
             };
-            let active = g.tasks.iter().filter(|t| t.is_active_pipeline()).count();
+            let mut changed = false;
+            for task in &mut g.tasks {
+                let old_status = task.status.clone();
+                let old_original = task.original_stage.clone();
+                let old_translation = task.translation_stage.clone();
+                task.normalize_state();
+                if task.status != old_status
+                    || task.original_stage != old_original
+                    || task.translation_stage != old_translation
+                {
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = task_store::save_task_store_file(&root.0, &g);
+            }
+            let active = g
+                .tasks
+                .iter()
+                .filter(|t| occupies_runner_slot(&t.status))
+                .count();
             if active >= cap as usize {
                 continue;
             }
@@ -664,17 +740,6 @@ fn run_one_task(
     }
     let wav_path = tmp_root.join("audio.wav");
     let w_prefix = tmp_root.join("w");
-
-    update_task_runtime_state(
-        ts,
-        root,
-        task_id,
-        Some(STATUS_RUNNING),
-        Some(ORIGINAL_STAGE_COMPLETED),
-        Some(TRANSLATION_STAGE_QUEUED),
-        None,
-        Some(""),
-    );
 
     match mid_run_poll(ts, task_id) {
         MidRun::Continue => {}
@@ -846,15 +911,35 @@ fn run_one_task(
         max_segment_ms: job.vad_max_segment_ms,
     });
 
-    if let Err(e) = run_whisper_srt_json(
-        &whisper_cli,
-        &model_path,
-        &wav_path,
-        &rec_lang,
-        threads,
-        force_cpu,
-        &w_prefix,
-        whisper_vad.as_ref(),
+    let recognition_peak = if job.will_translate {
+        44
+    } else if job.segmentation_strategy != "disabled" {
+        69
+    } else {
+        89
+    };
+    if let Err(e) = run_with_progress_heartbeat(
+        ts,
+        root,
+        task_id,
+        if job.whisper_enable_vad {
+            "vad_detect"
+        } else {
+            "transcribe"
+        },
+        recognition_peak,
+        || {
+            run_whisper_srt_json(
+                &whisper_cli,
+                &model_path,
+                &wav_path,
+                &rec_lang,
+                threads,
+                force_cpu,
+                &w_prefix,
+                whisper_vad.as_ref(),
+            )
+        },
     ) {
         fail_task(app, ts, root, task_id, &e);
         let _ = fs::remove_dir_all(&tmp_root);
@@ -988,6 +1073,8 @@ fn run_one_task(
             }
         }
     }
+
+    cues = optimize_source_cues(&cues);
 
     let p_tr_done = if job.will_translate { 60u8 } else { 90u8 };
     {
@@ -1284,6 +1371,17 @@ fn run_one_task(
         }
     }
 
+    update_task_runtime_state(
+        ts,
+        root,
+        task_id,
+        Some(STATUS_RUNNING),
+        Some(ORIGINAL_STAGE_COMPLETED),
+        Some(TRANSLATION_STAGE_QUEUED),
+        Some(60),
+        Some(""),
+    );
+
     if job.translator_engine == "llm" && llm_api_key_storage.trim().is_empty() {
         fail_task(
             app,
@@ -1455,16 +1553,8 @@ fn run_one_task(
                             fs::create_dir_all(parent)
                                 .map_err(|e| format!("创建输出目录失败: {e}"))?;
                         }
-                        let trans_cues: Vec<SubCue> = cues
-                            .iter()
-                            .zip(translated.iter())
-                            .map(|(c, t)| SubCue {
-                                index: c.index,
-                                start_ms: c.start_ms,
-                                end_ms: c.end_ms,
-                                text: t.clone(),
-                            })
-                            .collect();
+                        let trans_cues =
+                            optimize_translated_cues(&build_translated_cues(&cues, &translated)?);
                         fs::write(pb, format_srt(&trans_cues))
                             .map_err(|e| format!("写入译文字幕失败: {e}"))?;
                     }
@@ -1474,7 +1564,7 @@ fn run_one_task(
                             fs::create_dir_all(parent)
                                 .map_err(|e| format!("创建输出目录失败: {e}"))?;
                         }
-                        let bio = build_bilingual_cues(&cues, &translated)?;
+                        let bio = build_bilingual_cues_optimized(&cues, &translated)?;
                         fs::write(pb, format_srt(&bio))
                             .map_err(|e| format!("写入双语字幕失败: {e}"))?;
                     }
@@ -1527,5 +1617,21 @@ fn run_one_task(
             fail_task(app, ts, root, task_id, &e);
             let _ = fs::remove_dir_all(&tmp_root);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::occupies_runner_slot;
+    use crate::domain::task::{
+        STATUS_PAUSE_REQUESTED, STATUS_PENDING, STATUS_QUEUED, STATUS_RUNNING,
+    };
+
+    #[test]
+    fn queued_tasks_do_not_consume_runner_slots() {
+        assert!(!occupies_runner_slot(STATUS_PENDING));
+        assert!(!occupies_runner_slot(STATUS_QUEUED));
+        assert!(occupies_runner_slot(STATUS_RUNNING));
+        assert!(occupies_runner_slot(STATUS_PAUSE_REQUESTED));
     }
 }

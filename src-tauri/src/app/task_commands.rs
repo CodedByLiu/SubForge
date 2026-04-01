@@ -30,7 +30,10 @@ fn persist(root: &AppRoot, store: &TaskStoreFile) -> Result<(), String> {
 }
 
 fn eligible_for_start(status: &str) -> bool {
-    matches!(status, STATUS_PENDING | STATUS_PAUSED | STATUS_FAILED)
+    matches!(
+        status,
+        STATUS_PENDING | STATUS_PAUSED | STATUS_FAILED | STATUS_PAUSE_REQUESTED
+    )
 }
 
 fn build_snapshot_summary(cfg: &AppConfig, output_dir_mode: &str) -> String {
@@ -117,6 +120,11 @@ fn resume_with_existing_snapshot(task: &mut TaskRecord, tnow: i64) {
     };
     task.progress = 0;
     task.phase.clear();
+    task.updated_at_ms = tnow;
+}
+
+fn cancel_pause_request(task: &mut TaskRecord, tnow: i64) {
+    task.status = STATUS_RUNNING.into();
     task.updated_at_ms = tnow;
 }
 
@@ -502,6 +510,9 @@ pub fn start_task(
             apply_run_snapshot(t, &cfg, &od_mode, &od_custom);
             prepare_for_queue(t, tnow);
         }
+        STATUS_PAUSE_REQUESTED => {
+            cancel_pause_request(t, tnow);
+        }
         STATUS_PAUSED | STATUS_FAILED if has_snapshot(t) => {
             resume_with_existing_snapshot(t, tnow);
         }
@@ -531,6 +542,9 @@ pub fn start_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result
                     validate_prestart_requirements(&root, &cfg)?;
                     apply_run_snapshot(t, &cfg, &od_mode, &od_custom);
                     prepare_for_queue(t, tnow);
+                }
+                STATUS_PAUSE_REQUESTED => {
+                    cancel_pause_request(t, tnow);
                 }
                 STATUS_PAUSED | STATUS_FAILED if has_snapshot(t) => {
                     resume_with_existing_snapshot(t, tnow);
@@ -605,8 +619,10 @@ pub fn continue_all_tasks(
     let tnow = now_ms();
     for t in &mut store.tasks {
         t.normalize_state();
-        if t.status == STATUS_PAUSED {
-            resume_with_existing_snapshot(t, tnow);
+        match t.status.as_str() {
+            STATUS_PAUSED => resume_with_existing_snapshot(t, tnow),
+            STATUS_PAUSE_REQUESTED => cancel_pause_request(t, tnow),
+            _ => {}
         }
     }
     persist(&root, &store)

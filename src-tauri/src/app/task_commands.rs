@@ -8,9 +8,9 @@ use uuid::Uuid;
 
 use crate::domain::config::AppConfig;
 use crate::domain::task::{
-    TaskRecord, TaskStoreFile, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_PAUSE_REQUESTED, STATUS_PENDING, STATUS_QUEUED, STATUS_SEGMENTING, STATUS_TRANSCRIBING,
-    STATUS_TRANSLATING,
+    TaskRecord, TaskStoreFile, ORIGINAL_STAGE_WAITING, STATUS_FAILED, STATUS_PAUSED,
+    STATUS_PAUSE_REQUESTED, STATUS_PENDING, STATUS_QUEUED, STATUS_RUNNING,
+    TRANSLATION_STAGE_NOT_REQUIRED, TRANSLATION_STAGE_WAITING_ORIGINAL,
 };
 use crate::infra::config_store;
 use crate::infra::secrets;
@@ -95,6 +95,12 @@ fn validate_prestart_requirements(root: &AppRoot, cfg: &AppConfig) -> Result<(),
 fn prepare_for_queue(task: &mut TaskRecord, tnow: i64) {
     clear_run_artifacts(task);
     task.status = STATUS_QUEUED.into();
+    task.original_stage = ORIGINAL_STAGE_WAITING.into();
+    task.translation_stage = if task.will_translate {
+        TRANSLATION_STAGE_WAITING_ORIGINAL.into()
+    } else {
+        TRANSLATION_STAGE_NOT_REQUIRED.into()
+    };
     task.progress = 0;
     task.phase.clear();
     task.updated_at_ms = tnow;
@@ -103,6 +109,12 @@ fn prepare_for_queue(task: &mut TaskRecord, tnow: i64) {
 fn resume_with_existing_snapshot(task: &mut TaskRecord, tnow: i64) {
     clear_run_artifacts(task);
     task.status = STATUS_QUEUED.into();
+    task.original_stage = ORIGINAL_STAGE_WAITING.into();
+    task.translation_stage = if task.will_translate {
+        TRANSLATION_STAGE_WAITING_ORIGINAL.into()
+    } else {
+        TRANSLATION_STAGE_NOT_REQUIRED.into()
+    };
     task.progress = 0;
     task.phase.clear();
     task.updated_at_ms = tnow;
@@ -191,6 +203,8 @@ pub struct TaskRowDto {
     pub file_size: u64,
     pub duration_sec: Option<f64>,
     pub status: String,
+    pub original_stage: String,
+    pub translation_stage: String,
     pub progress: u8,
     pub phase: String,
     pub will_translate: bool,
@@ -229,9 +243,25 @@ pub fn list_tasks(
     ts: State<'_, TaskState>,
 ) -> Result<TaskListPanel, String> {
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
+    let mut changed = false;
     let before = store.tasks.len();
     store.tasks.retain(|t| !t.cancel_requested);
     if store.tasks.len() != before {
+        changed = true;
+    }
+    for task in &mut store.tasks {
+        let old_status = task.status.clone();
+        let old_original = task.original_stage.clone();
+        let old_translation = task.translation_stage.clone();
+        task.normalize_state();
+        if task.status != old_status
+            || task.original_stage != old_original
+            || task.translation_stage != old_translation
+        {
+            changed = true;
+        }
+    }
+    if changed {
         persist(&root, &store)?;
     }
     let show_translate_column = store.tasks.iter().any(|t| t.will_translate);
@@ -239,12 +269,7 @@ pub fn list_tasks(
     let needs_progress_refresh = store.tasks.iter().any(|t| {
         matches!(
             t.status.as_str(),
-            STATUS_QUEUED
-                | STATUS_EXTRACTING
-                | STATUS_TRANSCRIBING
-                | STATUS_SEGMENTING
-                | STATUS_TRANSLATING
-                | STATUS_PAUSE_REQUESTED
+            STATUS_QUEUED | STATUS_RUNNING | STATUS_PAUSE_REQUESTED
         )
     });
     let tasks = store
@@ -257,6 +282,8 @@ pub fn list_tasks(
             file_size: t.file_size,
             duration_sec: t.duration_sec,
             status: t.status.clone(),
+            original_stage: t.original_stage.clone(),
+            translation_stage: t.translation_stage.clone(),
             progress: t.progress,
             phase: t.phase.clone(),
             will_translate: t.will_translate,
@@ -346,6 +373,12 @@ pub fn import_videos(
             file_size,
             duration_sec: None,
             status: STATUS_PENDING.into(),
+            original_stage: ORIGINAL_STAGE_WAITING.into(),
+            translation_stage: if cfg.will_run_translation() {
+                TRANSLATION_STAGE_WAITING_ORIGINAL.into()
+            } else {
+                TRANSLATION_STAGE_NOT_REQUIRED.into()
+            },
             progress: 0,
             phase: String::new(),
             will_translate: false,
@@ -457,10 +490,12 @@ pub fn start_task(
         .iter_mut()
         .find(|t| t.id == id)
         .ok_or_else(|| "找不到任务".to_string())?;
+    t.normalize_state();
     if !eligible_for_start(&t.status) {
         return Err("当前状态不可开始".into());
     }
     let tnow = now_ms();
+    t.normalize_state();
     match t.status.as_str() {
         STATUS_PENDING => {
             validate_prestart_requirements(&root, &cfg)?;
@@ -489,6 +524,7 @@ pub fn start_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result
     let tnow = now_ms();
     let mut n = 0u32;
     for t in &mut store.tasks {
+        t.normalize_state();
         if eligible_for_start(&t.status) {
             match t.status.as_str() {
                 STATUS_PENDING => {
@@ -530,7 +566,7 @@ pub fn pause_task(
             t.status = STATUS_PAUSED.into();
             t.updated_at_ms = now_ms();
         }
-        STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_SEGMENTING | STATUS_TRANSLATING => {
+        STATUS_RUNNING => {
             t.status = STATUS_PAUSE_REQUESTED.into();
             t.updated_at_ms = now_ms();
         }
@@ -544,12 +580,13 @@ pub fn pause_all_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Re
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
     let tnow = now_ms();
     for t in &mut store.tasks {
+        t.normalize_state();
         match t.status.as_str() {
             STATUS_QUEUED => {
                 t.status = STATUS_PAUSED.into();
                 t.updated_at_ms = tnow;
             }
-            STATUS_EXTRACTING | STATUS_TRANSCRIBING | STATUS_SEGMENTING | STATUS_TRANSLATING => {
+            STATUS_RUNNING => {
                 t.status = STATUS_PAUSE_REQUESTED.into();
                 t.updated_at_ms = tnow;
             }
@@ -567,6 +604,7 @@ pub fn continue_all_tasks(
     let mut store = ts.0.lock().map_err(|e| e.to_string())?;
     let tnow = now_ms();
     for t in &mut store.tasks {
+        t.normalize_state();
         if t.status == STATUS_PAUSED {
             resume_with_existing_snapshot(t, tnow);
         }

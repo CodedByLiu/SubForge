@@ -5,6 +5,8 @@ export interface TaskRowDto {
   file_size: number;
   duration_sec: number | null;
   status: string;
+  original_stage: string;
+  translation_stage: string;
   progress: number;
   phase: string;
   will_translate: boolean;

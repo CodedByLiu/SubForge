@@ -82,6 +82,7 @@ pub fn save_config(
         let mut store = ts.0.lock().map_err(|e| e.to_string())?;
         let tnow = now_ms();
         for task in &mut store.tasks {
+            task.normalize_state();
             if task.status == STATUS_PENDING {
                 task.will_translate = cfg.will_run_translation();
                 task.translator_engine_snapshot = cfg.translator.engine.clone();

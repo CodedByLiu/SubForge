@@ -8,9 +8,12 @@ use tauri::{AppHandle, Emitter};
 use crate::app::state::AppRoot;
 use crate::domain::config::{AppConfig, GlossaryEntry};
 use crate::domain::task::{
-    TaskStoreFile, STATUS_COMPLETED, STATUS_EXTRACTING, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_PAUSE_REQUESTED, STATUS_QUEUED, STATUS_SEGMENTING, STATUS_TRANSCRIBING,
-    STATUS_TRANSLATING,
+    TaskStoreFile, ORIGINAL_STAGE_COMPLETED, ORIGINAL_STAGE_EXPORTING,
+    ORIGINAL_STAGE_EXTRACTING_AUDIO, ORIGINAL_STAGE_SEGMENTING, ORIGINAL_STAGE_TRANSCRIBING,
+    STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_PAUSE_REQUESTED, STATUS_QUEUED,
+    STATUS_RUNNING, TRANSLATION_STAGE_COMPLETED, TRANSLATION_STAGE_EXPORTING,
+    TRANSLATION_STAGE_NOT_REQUIRED, TRANSLATION_STAGE_QUEUED, TRANSLATION_STAGE_TRANSLATING,
+    TRANSLATION_STAGE_WAITING_ORIGINAL,
 };
 use crate::infra::config_store;
 use crate::infra::ffmpeg_tool::{extract_mono_16k_wav, resolve_ffmpeg};
@@ -57,6 +60,42 @@ fn emit_progress(app: &AppHandle, task_id: &str, status: &str, progress: u8, pha
             phase: phase.to_string(),
         },
     );
+}
+
+fn update_task_runtime_state(
+    ts: &Arc<Mutex<TaskStoreFile>>,
+    root: &AppRoot,
+    id: &str,
+    task_status: Option<&str>,
+    original_stage: Option<&str>,
+    translation_stage: Option<&str>,
+    progress: Option<u8>,
+    phase: Option<&str>,
+) {
+    let mut g = match ts.lock() {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+        t.normalize_state();
+        if let Some(status) = task_status {
+            t.status = status.into();
+        }
+        if let Some(stage) = original_stage {
+            t.original_stage = stage.into();
+        }
+        if let Some(stage) = translation_stage {
+            t.translation_stage = stage.into();
+        }
+        if let Some(value) = progress {
+            t.progress = value;
+        }
+        if let Some(value) = phase {
+            t.phase = value.into();
+        }
+        t.updated_at_ms = now_ms();
+        let _ = task_store::save_task_store_file(&root.0, &g);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +150,7 @@ fn apply_paused(ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id: &str, app: &
         _ => return,
     };
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+        t.normalize_state();
         if t.status == STATUS_PAUSE_REQUESTED {
             t.status = STATUS_PAUSED.into();
             t.phase.clear();
@@ -180,6 +220,7 @@ fn fail_task(app: &AppHandle, ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id
         return;
     }
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+        t.normalize_state();
         let log_msg: String = msg.chars().take(512).collect();
         let retry_limit = t.snapshot_task_auto_retry_max;
         let can_retry = !t.cancel_requested
@@ -189,6 +230,12 @@ fn fail_task(app: &AppHandle, ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id
         if can_retry {
             t.retry_attempts += 1;
             t.status = STATUS_QUEUED.into();
+            t.original_stage = crate::domain::task::ORIGINAL_STAGE_WAITING.into();
+            t.translation_stage = if t.will_translate {
+                TRANSLATION_STAGE_WAITING_ORIGINAL.into()
+            } else {
+                TRANSLATION_STAGE_NOT_REQUIRED.into()
+            };
             t.progress = 0;
             t.phase = format!("retry_{}", t.retry_attempts);
             t.cancel_requested = false;
@@ -213,7 +260,7 @@ fn fail_task(app: &AppHandle, ts: &Arc<Mutex<TaskStoreFile>>, root: &AppRoot, id
         }
 
         log::warn!(target: "subforge_task", "task_failed id={id} {log_msg}");
-        t.status = STATUS_FAILED.into();
+        t.mark_failed();
         t.cancel_requested = false;
         t.translate_note = None;
         t.segmentation_note = None;
@@ -453,7 +500,14 @@ fn succeed_task(
     }
     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
         log::info!(target: "subforge_task", "task_completed id={id}");
+        t.normalize_state();
         t.status = STATUS_COMPLETED.into();
+        t.original_stage = ORIGINAL_STAGE_COMPLETED.into();
+        if t.will_translate {
+            t.translation_stage = TRANSLATION_STAGE_COMPLETED.into();
+        } else {
+            t.translation_stage = TRANSLATION_STAGE_NOT_REQUIRED.into();
+        }
         t.progress = 100;
         t.phase.clear();
         t.error_message = None;
@@ -541,7 +595,14 @@ pub async fn run_forever(
                 continue;
             };
             let id = g.tasks[idx].id.clone();
-            g.tasks[idx].status = STATUS_EXTRACTING.into();
+            g.tasks[idx].normalize_state();
+            g.tasks[idx].status = STATUS_RUNNING.into();
+            g.tasks[idx].original_stage = ORIGINAL_STAGE_EXTRACTING_AUDIO.into();
+            g.tasks[idx].translation_stage = if g.tasks[idx].will_translate {
+                TRANSLATION_STAGE_WAITING_ORIGINAL.into()
+            } else {
+                TRANSLATION_STAGE_NOT_REQUIRED.into()
+            };
             g.tasks[idx].progress = 5;
             g.tasks[idx].phase = "extract_audio".into();
             g.tasks[idx].updated_at_ms = now_ms();
@@ -604,6 +665,17 @@ fn run_one_task(
     let wav_path = tmp_root.join("audio.wav");
     let w_prefix = tmp_root.join("w");
 
+    update_task_runtime_state(
+        ts,
+        root,
+        task_id,
+        Some(STATUS_RUNNING),
+        Some(ORIGINAL_STAGE_COMPLETED),
+        Some(TRANSLATION_STAGE_QUEUED),
+        None,
+        Some(""),
+    );
+
     match mid_run_poll(ts, task_id) {
         MidRun::Continue => {}
         MidRun::Pause => {
@@ -626,7 +698,7 @@ fn run_one_task(
         }
     };
 
-    emit_progress(app, task_id, STATUS_EXTRACTING, 10, "extract_audio");
+    emit_progress(app, task_id, STATUS_RUNNING, 10, "extract_audio");
     if let Err(e) = extract_mono_16k_wav(&ffmpeg, video, &wav_path) {
         fail_task(app, ts, root, task_id, &e);
         let _ = fs::remove_dir_all(&tmp_root);
@@ -727,7 +799,9 @@ fn run_one_task(
             Err(_) => return,
         };
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
-            t.status = STATUS_TRANSCRIBING.into();
+            t.normalize_state();
+            t.status = STATUS_RUNNING.into();
+            t.original_stage = ORIGINAL_STAGE_TRANSCRIBING.into();
             t.progress = p_tr_start;
             t.phase = if job.whisper_enable_vad {
                 "vad_detect".into()
@@ -741,7 +815,7 @@ fn run_one_task(
     emit_progress(
         app,
         task_id,
-        STATUS_TRANSCRIBING,
+        STATUS_RUNNING,
         p_tr_start,
         if job.whisper_enable_vad {
             "vad_detect"
@@ -847,7 +921,9 @@ fn run_one_task(
                 Err(_) => return,
             };
             if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
-                t.status = STATUS_SEGMENTING.into();
+                t.normalize_state();
+                t.status = STATUS_RUNNING.into();
+                t.original_stage = ORIGINAL_STAGE_SEGMENTING.into();
                 t.progress = if job.will_translate { 45 } else { 70 };
                 t.phase = "segment_subtitles".into();
                 t.updated_at_ms = now_ms();
@@ -857,7 +933,7 @@ fn run_one_task(
         emit_progress(
             app,
             task_id,
-            STATUS_SEGMENTING,
+            STATUS_RUNNING,
             if job.will_translate { 45 } else { 70 },
             "segment_subtitles",
         );
@@ -925,7 +1001,7 @@ fn run_one_task(
             let _ = task_store::save_task_store_file(&root.0, &g);
         }
     }
-    emit_progress(app, task_id, STATUS_TRANSCRIBING, p_tr_done, "transcribe");
+    emit_progress(app, task_id, STATUS_RUNNING, p_tr_done, "transcribe");
 
     if !job.will_translate {
         let final_path = match resolve_original_srt_path(
@@ -959,13 +1035,16 @@ fn run_one_task(
                 Err(_) => return,
             };
             if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
+                t.normalize_state();
+                t.status = STATUS_RUNNING.into();
+                t.original_stage = ORIGINAL_STAGE_EXPORTING.into();
                 t.progress = 95;
                 t.phase = "export_srt".into();
                 t.updated_at_ms = now_ms();
                 let _ = task_store::save_task_store_file(&root.0, &g);
             }
         }
-        emit_progress(app, task_id, STATUS_TRANSCRIBING, 95, "export_srt");
+        emit_progress(app, task_id, STATUS_RUNNING, 95, "export_srt");
         if let Some(parent) = final_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 fail_task(app, ts, root, task_id, &format!("创建输出目录失败: {e}"));
@@ -1001,6 +1080,16 @@ fn run_one_task(
             Some(&final_path),
             None,
             None,
+        );
+        update_task_runtime_state(
+            ts,
+            root,
+            task_id,
+            Some(STATUS_COMPLETED),
+            Some(ORIGINAL_STAGE_COMPLETED),
+            Some(TRANSLATION_STAGE_NOT_REQUIRED),
+            Some(100),
+            Some(""),
         );
         let _ = fs::remove_dir_all(&tmp_root);
         succeed_task(app, ts, root, task_id, None);
@@ -1157,6 +1246,16 @@ fn run_one_task(
 
     if job.subtitle_mode == "dual_files" {
         let po = dual_orig.as_ref().unwrap();
+        update_task_runtime_state(
+            ts,
+            root,
+            task_id,
+            Some(STATUS_RUNNING),
+            Some(ORIGINAL_STAGE_EXPORTING),
+            Some(TRANSLATION_STAGE_WAITING_ORIGINAL),
+            None,
+            Some("export_srt"),
+        );
         if let Some(parent) = po.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 fail_task(app, ts, root, task_id, &format!("创建输出目录失败: {e}"));
@@ -1203,7 +1302,10 @@ fn run_one_task(
             Err(_) => return,
         };
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
-            t.status = STATUS_TRANSLATING.into();
+            t.normalize_state();
+            t.status = STATUS_RUNNING.into();
+            t.original_stage = ORIGINAL_STAGE_COMPLETED.into();
+            t.translation_stage = TRANSLATION_STAGE_TRANSLATING.into();
             t.progress = 62;
             t.phase = if job.translator_engine == "google_web" {
                 "translate_google".into()
@@ -1217,7 +1319,7 @@ fn run_one_task(
     emit_progress(
         app,
         task_id,
-        STATUS_TRANSLATING,
+        STATUS_RUNNING,
         62,
         if job.translator_engine == "google_web" {
             "translate_google"
@@ -1282,7 +1384,7 @@ fn run_one_task(
                         let _ = task_store::save_task_store_file(&root_prog, &g);
                     }
                 }
-                emit_progress(&app_prog, &tid_prog, STATUS_TRANSLATING, p, "translate_llm");
+                emit_progress(&app_prog, &tid_prog, STATUS_RUNNING, p, "translate_llm");
             },
             Some(llm_slots),
             job.translate_concurrency,
@@ -1320,13 +1422,7 @@ fn run_one_task(
                         let _ = task_store::save_task_store_file(&root_prog, &g);
                     }
                 }
-                emit_progress(
-                    &app_prog,
-                    &tid_prog,
-                    STATUS_TRANSLATING,
-                    p,
-                    "translate_google",
-                );
+                emit_progress(&app_prog, &tid_prog, STATUS_RUNNING, p, "translate_google");
             },
         )
         .map(|translated| (translated, false))
@@ -1340,13 +1436,16 @@ fn run_one_task(
                     Err(_) => return,
                 };
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
+                    t.normalize_state();
+                    t.status = STATUS_RUNNING.into();
+                    t.translation_stage = TRANSLATION_STAGE_EXPORTING.into();
                     t.progress = 90;
                     t.phase = "export_srt".into();
                     t.updated_at_ms = now_ms();
                     let _ = task_store::save_task_store_file(&root.0, &g);
                 }
             }
-            emit_progress(app, task_id, STATUS_TRANSLATING, 90, "export_srt");
+            emit_progress(app, task_id, STATUS_RUNNING, 90, "export_srt");
 
             let r_export = (|| -> Result<(), String> {
                 match job.subtitle_mode.as_str() {

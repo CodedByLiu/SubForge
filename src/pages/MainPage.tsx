@@ -24,16 +24,10 @@ function formatSize(n: number): string {
 }
 
 const S_START = ["pending", "paused", "failed"];
-const S_PAUSE = ["queued", "extracting_audio", "transcribing", "translating"];
+const S_PAUSE = ["queued", "running"];
 
 function pipelineActiveStatus(status: string): boolean {
-  return [
-    "queued",
-    "extracting_audio",
-    "transcribing",
-    "translating",
-    "pause_requested",
-  ].includes(status);
+  return ["queued", "running", "pause_requested"].includes(status);
 }
 
 export function MainPage() {

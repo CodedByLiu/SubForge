@@ -30,8 +30,6 @@ pub struct TranslatorConfig {
     pub use_proxy: bool,
     #[serde(default)]
     pub min_request_interval_ms: u32,
-    #[serde(default)]
-    pub experimental_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +148,19 @@ pub struct TestLlmRequest {
     pub timeout_sec: u32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestGoogleWebRequest {
+    #[serde(default)]
+    pub provider_url: String,
+    #[serde(default)]
+    pub use_proxy: bool,
+    #[serde(default)]
+    pub source_lang: String,
+    #[serde(default)]
+    pub target_lang: String,
+    pub timeout_sec: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LlmTestResult {
     pub ok: bool,
@@ -198,7 +209,6 @@ impl Default for AppConfig {
                 provider_url: String::new(),
                 use_proxy: false,
                 min_request_interval_ms: 1000,
-                experimental_acknowledged: false,
             },
             whisper: WhisperConfig {
                 model: "base".into(),

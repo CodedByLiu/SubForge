@@ -5,7 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tauri::State;
 
-use crate::domain::config::{AppConfigView, LlmTestResult, SaveConfigRequest, TestLlmRequest};
+use crate::domain::config::{
+    AppConfigView, LlmTestResult, SaveConfigRequest, TestGoogleWebRequest, TestLlmRequest,
+};
 use crate::domain::task::STATUS_PENDING;
 
 fn ok_llm_test(r: LlmTestResult) -> Result<LlmTestResult, String> {
@@ -17,9 +19,23 @@ fn ok_llm_test(r: LlmTestResult) -> Result<LlmTestResult, String> {
     );
     Ok(r)
 }
+
+fn ok_google_test(r: LlmTestResult) -> Result<LlmTestResult, String> {
+    log::info!(
+        target: "subforge_google",
+        "google_connection_test ok={} code={}",
+        r.ok,
+        r.code
+    );
+    Ok(r)
+}
 use crate::infra::config_store;
+use crate::infra::google_translate::{
+    effective_google_url, format_google_request_error, normalize_lang, parse_google_body,
+};
 use crate::infra::openai_compat::{chat_completions_url, truncate_detail};
 use crate::infra::secrets;
+use crate::infra::system_proxy;
 use crate::infra::task_store;
 
 use super::state::{AppRoot, TaskState};
@@ -223,6 +239,124 @@ pub async fn test_llm_connection(
                     detail: Some(e.to_string()),
                 })
             }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn test_google_web_connection(
+    req: TestGoogleWebRequest,
+) -> Result<LlmTestResult, String> {
+    let TestGoogleWebRequest {
+        provider_url,
+        use_proxy,
+        source_lang,
+        target_lang,
+        timeout_sec,
+    } = req;
+
+    let url = effective_google_url(&provider_url);
+    let sl = normalize_lang(&source_lang);
+    let tl = normalize_lang(&target_lang);
+    if tl == "auto" {
+        return ok_google_test(LlmTestResult {
+            ok: false,
+            code: "invalid_input".into(),
+            message: "Google Web 测试失败：目标语言不能为空".into(),
+            detail: None,
+        });
+    }
+
+    let builder =
+        reqwest::Client::builder().timeout(Duration::from_secs(timeout_sec.max(1) as u64));
+    let (builder, proxy_display) = match system_proxy::apply_to_async_builder(builder, use_proxy) {
+        Ok(v) => v,
+        Err(e) => {
+            return ok_google_test(LlmTestResult {
+                ok: false,
+                code: "proxy_config".into(),
+                message: e,
+                detail: None,
+            });
+        }
+    };
+
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            return ok_google_test(LlmTestResult {
+                ok: false,
+                code: "client_init_failed".into(),
+                message: format!("Google Web 测试客户端初始化失败: {e}"),
+                detail: None,
+            });
+        }
+    };
+
+    let request_url = format!(
+        "{}?client=gtx&sl={}&tl={}&dt=t&q={}",
+        url,
+        urlencoding::encode(&sl),
+        urlencoding::encode(&tl),
+        urlencoding::encode("hello")
+    );
+
+    let resp = client.get(&request_url).send().await;
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return ok_google_test(LlmTestResult {
+                    ok: false,
+                    code: "http_error".into(),
+                    message: format!("Google Web 测试失败：HTTP {}", status.as_u16()),
+                    detail: Some(truncate_detail(&text, 800)),
+                });
+            }
+
+            match parse_google_body(&text) {
+                Ok(translated) => {
+                    let network_path = match proxy_display {
+                        Some(proxy) => format!("通过系统代理访问: {proxy}"),
+                        None => "直连访问（未使用代理）".to_string(),
+                    };
+                    ok_google_test(LlmTestResult {
+                        ok: true,
+                        code: "ok".into(),
+                        message: "Google Web 连接成功".into(),
+                        detail: Some(format!(
+                            "测试结果: hello -> {}\n请求地址: {}\n网络路径: {}",
+                            translated, url, network_path
+                        )),
+                    })
+                }
+                Err(e) => ok_google_test(LlmTestResult {
+                    ok: false,
+                    code: "parse_error".into(),
+                    message: "Google Web 返回了响应，但格式无法解析".into(),
+                    detail: Some(format!("{e}\n\n原始响应: {}", truncate_detail(&text, 800))),
+                }),
+            }
+        }
+        Err(e) => {
+            let network_path = match proxy_display {
+                Some(proxy) => format!("通过系统代理访问: {proxy}"),
+                None => "直连访问（未使用代理）".to_string(),
+            };
+            let code = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "network"
+            } else {
+                "request_failed"
+            };
+            ok_google_test(LlmTestResult {
+                ok: false,
+                code: code.into(),
+                message: format_google_request_error(&e, &url, use_proxy),
+                detail: Some(network_path),
+            })
         }
     }
 }

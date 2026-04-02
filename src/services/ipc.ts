@@ -36,6 +36,20 @@ export async function testLlmConnection(
   return invoke("test_llm_connection", { req: payload });
 }
 
+export interface TestGoogleWebPayload {
+  provider_url: string;
+  use_proxy: boolean;
+  source_lang: string;
+  target_lang: string;
+  timeout_sec: number;
+}
+
+export async function testGoogleWebConnection(
+  payload: TestGoogleWebPayload,
+): Promise<LlmTestResult> {
+  return invoke("test_google_web_connection", { req: payload });
+}
+
 export async function getHardwareInfo(
   useWhisperGpu: boolean,
 ): Promise<import("@/types/hardware").HardwareInfoDto> {

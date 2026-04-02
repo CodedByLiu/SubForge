@@ -84,6 +84,7 @@ pub fn run() {
             config_commands::get_config,
             config_commands::save_config,
             config_commands::test_llm_connection,
+            config_commands::test_google_web_connection,
             task_commands::list_tasks,
             task_commands::set_panel_output,
             task_commands::import_videos,

@@ -1469,7 +1469,10 @@ fn run_one_task(
             job.translate_concurrency,
         )
     } else {
-        let google_client = match build_google_client(job.translator_use_proxy) {
+        let google_client = match build_google_client(
+            job.translator_use_proxy,
+            job.llm_timeout_sec.max(5),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 fail_task(app, ts, root, task_id, &e);
@@ -1479,6 +1482,7 @@ fn run_one_task(
         };
         let gjob = GoogleWebTranslateJob {
             provider_url: job.translator_provider_url.as_str(),
+            use_proxy: job.translator_use_proxy,
             min_interval_ms: job.translator_min_interval_ms,
             source_lang: job.translate_source_lang.as_str(),
             target_lang: job.translate_target_lang.as_str(),

@@ -103,7 +103,9 @@ fn visible_len(text: &str) -> usize {
 }
 
 fn word_count(text: &str) -> usize {
-    text.split_whitespace().filter(|part| !part.is_empty()).count()
+    text.split_whitespace()
+        .filter(|part| !part.is_empty())
+        .count()
 }
 
 fn ends_with_terminal(text: &str) -> bool {
@@ -278,7 +280,8 @@ fn is_target_fragment(cue: &SubCue) -> bool {
     if len <= TARGET_FRAGMENT_HARD_MAX_CHARS {
         return true;
     }
-    if len <= TARGET_FRAGMENT_SOFT_MAX_CHARS && cue_duration(cue) <= TARGET_FRAGMENT_MAX_DURATION_MS {
+    if len <= TARGET_FRAGMENT_SOFT_MAX_CHARS && cue_duration(cue) <= TARGET_FRAGMENT_MAX_DURATION_MS
+    {
         return true;
     }
     starts_with_any(text, LEADING_TARGET_WORDS) || ends_with_any(text, TRAILING_TARGET_WORDS)
@@ -427,7 +430,11 @@ pub fn build_bilingual_cues_optimized(
     let mut merged_sources = Vec::<SubCue>::new();
     let mut merged_targets = Vec::<String>::new();
 
-    for (source, target) in sources.iter().cloned().zip(translated_lines.iter().cloned()) {
+    for (source, target) in sources
+        .iter()
+        .cloned()
+        .zip(translated_lines.iter().cloned())
+    {
         let current_target = target.trim().to_string();
         if let (Some(prev_source), Some(prev_target)) =
             (merged_sources.last_mut(), merged_targets.last_mut())

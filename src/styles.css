@@ -237,6 +237,70 @@ label.field span {
   line-height: 1.45;
 }
 
+/* Google Web：标签下输入框与复选框两列、垂直居中对齐（列宽与 field-grid.two 的 1fr 1fr 一致） */
+.field-grid.two > .translator-pair-row {
+  grid-column: 1 / -1;
+}
+
+.translator-pair-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 0.75rem;
+  row-gap: 0.35rem;
+  align-items: center;
+}
+
+.translator-pair-label {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.translator-pair-input-wrap {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+}
+
+.translator-pair-input-wrap input {
+  width: 100%;
+}
+
+.translator-pair-check {
+  grid-column: 2;
+  grid-row: 2;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.translator-pair-check span {
+  color: var(--muted);
+}
+
+@media (max-width: 639px) {
+  .translator-pair-row {
+    grid-template-columns: 1fr;
+  }
+
+  .translator-pair-input-wrap {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .translator-pair-check {
+    grid-column: 1;
+    grid-row: 3;
+  }
+}
+
 /* 推理模型下拉与「优先使用镜像」：第二行同高，复选框与下拉垂直居中 */
 .field-grid.two > .whisper-model-mirror-row {
   grid-column: 1 / -1;

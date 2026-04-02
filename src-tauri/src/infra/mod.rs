@@ -11,6 +11,7 @@ pub mod secrets;
 pub mod srt;
 pub mod subtitle_output;
 pub mod subtitle_segmentation;
+pub mod system_proxy;
 pub mod task_store;
 pub mod transcribe_deps;
 pub mod whisper_models;

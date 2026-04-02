@@ -23,10 +23,7 @@ struct LlmSlotsInner {
     cvar: Condvar,
 }
 
-fn lock_active<'a>(
-    inner: &'a LlmSlotsInner,
-    context: &str,
-) -> std::sync::MutexGuard<'a, u32> {
+fn lock_active<'a>(inner: &'a LlmSlotsInner, context: &str) -> std::sync::MutexGuard<'a, u32> {
     match inner.active.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {

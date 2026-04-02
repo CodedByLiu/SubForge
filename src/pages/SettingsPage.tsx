@@ -10,6 +10,7 @@ import {
   getHardwareInfo,
   listWhisperModels,
   saveConfig,
+  testGoogleWebConnection,
   testLlmConnection,
   type SaveConfigPayload,
 } from "@/services/ipc";
@@ -64,6 +65,8 @@ export function SettingsPage() {
   const [busy, setBusy] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
   const [testResult, setTestResult] = useState<LlmTestResult | null>(null);
+  const [googleTestBusy, setGoogleTestBusy] = useState(false);
+  const [googleTestResult, setGoogleTestResult] = useState<LlmTestResult | null>(null);
   const [hw, setHw] = useState<HardwareInfoDto | null>(null);
   const [whisperList, setWhisperList] = useState<WhisperModelsListDto | null>(null);
   const [dlProgress, setDlProgress] = useState<WhisperDownloadProgress | null>(null);
@@ -102,6 +105,7 @@ export function SettingsPage() {
       setApiKeyConfigured(view.api_key_configured);
       setApiKeyInput("");
       setTestResult(null);
+      setGoogleTestResult(null);
       await refreshWhisperPanel(merged.whisper.use_gpu);
     } catch (e) {
       setLoadErr(String(e));
@@ -219,9 +223,38 @@ export function SettingsPage() {
     }
   };
 
+  const onTestGoogleWeb = async () => {
+    setGoogleTestResult(null);
+    setGoogleTestBusy(true);
+    try {
+      const r = await testGoogleWebConnection({
+        provider_url: cfg.translator.provider_url,
+        use_proxy: cfg.translator.use_proxy,
+        source_lang: cfg.translate.source_lang,
+        target_lang: cfg.translate.target_lang,
+        timeout_sec: cfg.llm.timeout_sec,
+      });
+      setGoogleTestResult(r);
+    } catch (e) {
+      setGoogleTestResult({
+        ok: false,
+        code: "invoke_error",
+        message: String(e),
+      });
+    } finally {
+      setGoogleTestBusy(false);
+    }
+  };
+
   const translateSectionVisible =
     cfg.translator.engine !== "none" && cfg.subtitle.mode !== "original_only";
   const recommendedWhisperModel = hw?.whisper_recommended_models?.[0] ?? null;
+  const downloadedWhisperModels = (whisperList?.models ?? [])
+    .filter((m) => m.downloaded)
+    .map((m) => m.id);
+  const selectedWhisperModel = downloadedWhisperModels.includes(cfg.whisper.model)
+    ? cfg.whisper.model
+    : "";
 
   const addGlossaryRow = () => {
     setTranslate({
@@ -390,21 +423,24 @@ export function SettingsPage() {
         )}
         {cfg.translator.engine === "google_web" && (
           <div className="field-grid two" style={{ marginTop: "0.75rem" }}>
-            <label className="field">
-              <span>服务地址（可选）</span>
-              <input
-                value={cfg.translator.provider_url}
-                onChange={(e) => setTranslator({ provider_url: e.target.value })}
-              />
-            </label>
-            <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-              <input
-                type="checkbox"
-                checked={cfg.translator.use_proxy}
-                onChange={(e) => setTranslator({ use_proxy: e.target.checked })}
-              />
-              <span>使用代理</span>
-            </label>
+            <div className="translator-pair-row">
+              <span className="translator-pair-label">服务地址（可选）</span>
+              <div className="translator-pair-input-wrap">
+                <input
+                  value={cfg.translator.provider_url}
+                  onChange={(e) => setTranslator({ provider_url: e.target.value })}
+                  placeholder="留空则使用 Google 默认地址"
+                />
+              </div>
+              <label className="translator-pair-check">
+                <input
+                  type="checkbox"
+                  checked={cfg.translator.use_proxy}
+                  onChange={(e) => setTranslator({ use_proxy: e.target.checked })}
+                />
+                <span>使用代理</span>
+              </label>
+            </div>
             <label className="field">
               <span>最小请求间隔（毫秒）</span>
               <input
@@ -418,16 +454,31 @@ export function SettingsPage() {
                 }
               />
             </label>
-            <label className="field" style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem" }}>
-              <input
-                type="checkbox"
-                checked={cfg.translator.experimental_acknowledged}
-                onChange={(e) =>
-                  setTranslator({ experimental_acknowledged: e.target.checked })
-                }
-              />
-              <span>已知悉实验性风险</span>
-            </label>
+            <div className="row-actions" style={{ gridColumn: "1 / -1" }}>
+              <button
+                type="button"
+                disabled={googleTestBusy}
+                onClick={() => void onTestGoogleWeb()}
+              >
+                {googleTestBusy ? "测试中…" : "测试 Google Web 连接"}
+              </button>
+            </div>
+            {googleTestResult && (
+              <div
+                className={`test-result ${googleTestResult.ok ? "ok" : "err"}`}
+                style={{ gridColumn: "1 / -1" }}
+              >
+                {googleTestResult.message}
+                {googleTestResult.detail ? `\n${googleTestResult.detail}` : ""}
+              </div>
+            )}
+            <p className="muted" style={{ gridColumn: "1 / -1", margin: 0 }}>
+              代理的意思是：让程序走 Windows 当前系统代理，例如 Clash 或 v2rayN 提供的
+              `127.0.0.1:7890`，而不是直接访问 Google。
+            </p>
+            <p className="muted" style={{ gridColumn: "1 / -1", margin: 0 }}>
+              勾选后会自动读取系统代理；正式翻译和“测试 Google Web 连接”会使用同一套代理和超时设置。
+            </p>
             <p className="muted" style={{ gridColumn: "1 / -1", margin: 0 }}>
               实验性功能可能因接口变更、限流或区域限制不可用；首版以 LLM 为主路径。
             </p>
@@ -740,10 +791,19 @@ export function SettingsPage() {
               <select
                 id="whisper-infer-model"
                 className="whisper-mm-select"
-                value={cfg.whisper.model}
-                onChange={(e) => setWhisper({ model: e.target.value })}
+                value={selectedWhisperModel}
+                disabled={downloadedWhisperModels.length === 0}
+                onChange={(e) => {
+                  if (!e.target.value) return;
+                  setWhisper({ model: e.target.value });
+                }}
               >
-                {["tiny", "base", "small", "medium", "large-v3"].map((m) => (
+                <option value="" disabled>
+                  {downloadedWhisperModels.length === 0
+                    ? "请先下载模型"
+                    : "请选择已下载模型"}
+                </option>
+                {downloadedWhisperModels.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -847,13 +907,31 @@ export function SettingsPage() {
                           disabled={modelBusy || m.downloaded}
                           onClick={() => {
                             setModelErr(null);
-                            setDlProgress(null);
+                            setDlProgress({
+                              model_id: m.id,
+                              percent: 1,
+                              bytes_received: 0,
+                              bytes_total: null,
+                              phase: "preparing",
+                              message: "正在准备下载环境…",
+                            });
                             setModelBusy(true);
                             void downloadWhisperModel(m.id)
-                              .catch((e) => setModelErr(String(e)))
+                              .catch((e) => {
+                                const message = String(e);
+                                setModelErr(message);
+                                setDlProgress((current) =>
+                                  current
+                                    ? {
+                                        ...current,
+                                        phase: "error",
+                                        message: `下载失败：${message}`,
+                                      }
+                                    : null,
+                                );
+                              })
                               .finally(() => {
                                 setModelBusy(false);
-                                setDlProgress(null);
                               });
                           }}
                         >

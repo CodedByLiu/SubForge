@@ -397,10 +397,8 @@ fn translate_indices_recursive(
                     found.len(),
                     indices.len()
                 );
-                let found_lookup: HashMap<u32, usize> = indices
-                    .iter()
-                    .map(|&idx| (cues[idx].index, idx))
-                    .collect();
+                let found_lookup: HashMap<u32, usize> =
+                    indices.iter().map(|&idx| (cues[idx].index, idx)).collect();
                 let found_indices: Vec<(usize, String)> = found
                     .into_iter()
                     .filter_map(|(id, text)| found_lookup.get(&id).copied().map(|idx| (idx, text)))

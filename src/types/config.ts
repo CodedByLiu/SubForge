@@ -11,7 +11,6 @@ export interface TranslatorConfig {
   provider_url: string;
   use_proxy: boolean;
   min_request_interval_ms: number;
-  experimental_acknowledged: boolean;
 }
 
 export interface WhisperConfig {
@@ -108,7 +107,6 @@ export function defaultAppConfig(): AppConfig {
       provider_url: "",
       use_proxy: false,
       min_request_interval_ms: 1000,
-      experimental_acknowledged: false,
     },
     whisper: {
       model: "base",

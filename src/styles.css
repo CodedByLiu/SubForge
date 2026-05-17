@@ -645,4 +645,36 @@ textarea {
 .progress-bar-fill {
   background: linear-gradient(90deg, var(--primary-from), var(--primary-to));
   box-shadow: 0 0 10px rgba(255, 138, 0, 0.28);
+  height: 100%;
+  border-radius: inherit;
+  transition: width 220ms ease-out;
+}
+
+.cell-progress {
+  min-width: 140px;
+}
+
+.progress-bar {
+  position: relative;
+  height: 6px;
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-bar.variant-done .progress-bar-fill {
+  background: linear-gradient(90deg, #4ade80, #22c55e);
+  box-shadow: 0 0 10px rgba(34, 197, 94, 0.32);
+}
+
+.progress-bar.variant-failed .progress-bar-fill {
+  background: linear-gradient(90deg, #94a3b8, #64748b);
+  box-shadow: none;
+}
+
+.progress-text {
+  margin-top: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--muted);
 }

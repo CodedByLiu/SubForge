@@ -26,7 +26,7 @@ thiserror = "2"
 aes-gcm = "0.10"
 getrandom = "0.3"
 base64 = "0.22"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "native-tls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "io-util"] }
 futures-util = "0.3"
 sysinfo = "0.33"

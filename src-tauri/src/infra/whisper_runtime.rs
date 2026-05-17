@@ -66,6 +66,7 @@ pub fn ensure_managed_whisper_cli(
     });
 
     let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| format!("初始化下载客户端失败: {e}"))?;
@@ -211,6 +212,7 @@ pub fn ensure_managed_whisper_vad_model(
     fs::create_dir_all(&managed_dir).map_err(|e| format!("创建目录失败: {e}"))?;
 
     let client = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| format!("初始化下载客户端失败: {e}"))?;

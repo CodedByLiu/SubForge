@@ -69,3 +69,21 @@ export async function deleteWhisperModel(modelId: string): Promise<void> {
 export async function downloadWhisperModel(modelId: string): Promise<void> {
   return invoke("download_whisper_model", { modelId });
 }
+
+export interface CacheStatsDto {
+  entry_count: number;
+  total_bytes: number;
+}
+
+export interface CacheClearResultDto {
+  deleted_count: number;
+  freed_bytes: number;
+}
+
+export async function getCacheStats(): Promise<CacheStatsDto> {
+  return invoke("get_cache_stats");
+}
+
+export async function clearCache(olderThanDays: number): Promise<CacheClearResultDto> {
+  return invoke("clear_cache", { olderThanDays });
+}

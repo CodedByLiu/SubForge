@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::domain::config::AppConfig;
 
 use super::ffmpeg_tool::resolve_ffmpeg;
+use super::process::apply_windows_no_window;
 use super::whisper_models::model_file_path;
 use super::whisper_runtime;
 use super::whisper_tool::resolve_whisper_cli;
@@ -51,7 +52,9 @@ pub fn check_with_progress(
     match resolve_ffmpeg(&cfg.whisper.ffmpeg_path) {
         Ok(p) => {
             r.ffmpeg_resolved = Some(p.to_string_lossy().to_string());
-            match Command::new(&p).arg("-version").output() {
+            let mut ffmpeg_check_cmd = Command::new(&p);
+            apply_windows_no_window(&mut ffmpeg_check_cmd);
+            match ffmpeg_check_cmd.arg("-version").output() {
                 Ok(o) if o.status.success() => {
                     r.ffmpeg_ok = true;
                     r.ffmpeg_detail = "ffmpeg 可执行".into();
@@ -81,7 +84,9 @@ pub fn check_with_progress(
     match resolve_whisper_cli(app_dir, &cfg.whisper.whisper_cli_path) {
         Ok(p) => {
             r.whisper_resolved = Some(p.to_string_lossy().to_string());
-            match Command::new(&p).arg("-h").output() {
+            let mut whisper_check_cmd = Command::new(&p);
+            apply_windows_no_window(&mut whisper_check_cmd);
+            match whisper_check_cmd.arg("-h").output() {
                 Ok(o) if o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty() => {
                     r.whisper_ok = true;
                     r.whisper_detail = "Whisper CLI 可执行".into();

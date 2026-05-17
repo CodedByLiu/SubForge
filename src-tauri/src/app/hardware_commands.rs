@@ -118,6 +118,7 @@ pub async fn download_whisper_model(
 
     let result = async {
         let client = reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(Duration::from_secs(7200))
             .build()
             .map_err(|e| e.to_string())?;

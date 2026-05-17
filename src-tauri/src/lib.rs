@@ -2,6 +2,7 @@ mod app;
 mod domain;
 mod infra;
 
+use app::cache_commands;
 use app::config_commands;
 use app::hardware_commands;
 use app::state::{AppRoot, TaskState, WhisperDownloadLock};
@@ -101,6 +102,8 @@ pub fn run() {
             hardware_commands::list_whisper_models,
             hardware_commands::delete_whisper_model,
             hardware_commands::download_whisper_model,
+            cache_commands::get_cache_stats,
+            cache_commands::clear_cache,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

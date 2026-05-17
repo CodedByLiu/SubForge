@@ -496,6 +496,7 @@ pub fn translate_all_cues(
     max_segment_chars: u32,
     mut pause_requested: impl FnMut() -> bool,
     mut on_progress: impl FnMut(usize, usize),
+    mut on_item_done: impl FnMut(usize, &str),
     llm_slots: Option<&LlmRequestSlots>,
     llm_concurrency_cap: u32,
 ) -> Result<(Vec<String>, bool), String> {
@@ -537,6 +538,7 @@ pub fn translate_all_cues(
         any_fb |= fb;
         for (&i, t) in batch.iter().zip(parts.iter()) {
             out[i] = t.clone();
+            on_item_done(i, t);
         }
         done += batch.len();
         last_tail = batch.last().map(|&i| out[i].clone());

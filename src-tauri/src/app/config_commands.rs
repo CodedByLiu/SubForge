@@ -32,6 +32,7 @@ fn ok_google_test(r: LlmTestResult) -> Result<LlmTestResult, String> {
 use crate::infra::config_store;
 use crate::infra::google_translate::{
     effective_google_url, format_google_request_error, normalize_lang, parse_google_body,
+    GOOGLE_WEB_USER_AGENT,
 };
 use crate::infra::openai_compat::{chat_completions_url, truncate_detail};
 use crate::infra::secrets;
@@ -160,6 +161,7 @@ pub async fn test_llm_connection(
     let url = chat_completions_url(base);
     let timeout = Duration::from_secs(timeout_sec.max(1) as u64);
     let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
@@ -267,8 +269,11 @@ pub async fn test_google_web_connection(
         });
     }
 
-    let builder =
-        reqwest::Client::builder().timeout(Duration::from_secs(timeout_sec.max(1) as u64));
+    let builder = reqwest::Client::builder()
+        .use_native_tls()
+        .http1_only()
+        .timeout(Duration::from_secs(timeout_sec.max(1) as u64))
+        .user_agent(GOOGLE_WEB_USER_AGENT);
     let (builder, proxy_display) = match system_proxy::apply_to_async_builder(builder, use_proxy) {
         Ok(v) => v,
         Err(e) => {

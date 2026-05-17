@@ -16,11 +16,30 @@ import {
   startTasks,
 } from "@/services/tasksIpc";
 import type { TaskListPanel, TaskRowDto } from "@/types/tasks";
+import { phaseLabel } from "@/utils/phaseLabel";
 
 function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function ProgressCell({ task }: { task: TaskRowDto }) {
+  const completed = task.status === "completed";
+  const failed = task.status === "failed";
+  const pct = completed ? 100 : failed ? task.progress : task.progress;
+  const label = phaseLabel(task.phase);
+  const variant = completed ? "done" : failed ? "failed" : "active";
+  return (
+    <div className="cell-progress">
+      <div className={`progress-bar variant-${variant}`}>
+        <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="progress-text">
+        {completed ? "100%" : failed ? `${task.progress}% · 失败` : `${task.progress}%${label ? ` · ${label}` : ""}`}
+      </div>
+    </div>
+  );
 }
 
 const STARTABLE_STATUSES = ["pending", "paused", "failed", "pause_requested"];
@@ -380,11 +399,7 @@ export function MainPage() {
                   ) : null}
 
                   <td>
-                    {task.status === "failed" || task.status === "completed"
-                      ? task.status === "completed"
-                        ? "100%"
-                        : "-"
-                      : `${task.progress}%${task.phase ? ` · ${task.phase}` : ""}`}
+                    <ProgressCell task={task} />
                     {task.retry_attempts > 0 ? (
                       <div className="cell-meta muted">Retry {task.retry_attempts}</div>
                     ) : null}

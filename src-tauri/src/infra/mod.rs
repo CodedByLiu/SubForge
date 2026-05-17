@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config_store;
 pub mod ffmpeg_tool;
 pub mod google_translate;
@@ -6,6 +7,7 @@ pub mod layout;
 pub mod llm_translate;
 pub mod openai_compat;
 pub mod paths;
+pub mod process;
 pub mod runner_limits;
 pub mod secrets;
 pub mod srt;

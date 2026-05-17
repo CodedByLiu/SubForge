@@ -1,3 +1,4 @@
+pub mod cache_commands;
 pub mod config_commands;
 pub mod hardware_commands;
 pub mod state;

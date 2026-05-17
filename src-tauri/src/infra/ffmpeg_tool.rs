@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use which::which;
 
+use super::process::apply_windows_no_window;
+
 pub fn resolve_ffmpeg(preferred: &str) -> Result<PathBuf, String> {
     let p = preferred.trim();
     if !p.is_empty() {
@@ -20,7 +22,10 @@ pub fn extract_mono_16k_wav(ffmpeg: &Path, video: &Path, wav_out: &Path) -> Resu
     if let Some(parent) = wav_out.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建临时目录失败: {e}"))?;
     }
-    let out = std::process::Command::new(ffmpeg)
+
+    let mut cmd = std::process::Command::new(ffmpeg);
+    apply_windows_no_window(&mut cmd);
+    let out = cmd
         .arg("-hide_banner")
         .arg("-nostdin")
         .arg("-y")
@@ -36,10 +41,12 @@ pub fn extract_mono_16k_wav(ffmpeg: &Path, video: &Path, wav_out: &Path) -> Resu
         .arg(wav_out)
         .output()
         .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let msg: String = err.chars().take(4000).collect();
         return Err(format!("ffmpeg 抽取音频失败: {msg}"));
     }
+
     Ok(())
 }

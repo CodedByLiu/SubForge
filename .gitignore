@@ -7,3 +7,21 @@ src-tauri/gen/
 Thumbs.db
 .env
 .env.*
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS junk
+Desktop.ini
+~$*
+
+# Claude Code local session data (per-machine settings, plans, transcripts)
+.claude/
+
+# Local backups
+*.bak
+*.orig

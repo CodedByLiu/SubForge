@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -7,6 +8,10 @@ use super::srt::SubCue;
 use super::system_proxy;
 
 const DEFAULT_GOOGLE_WEB_URL: &str = "https://translate.googleapis.com/translate_a/single";
+pub(crate) const GOOGLE_WEB_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const GOOGLE_TRANSLATE_MAX_RETRIES: u32 = 3;
+const GOOGLE_TRANSLATE_BACKOFF_BASE_MS: u64 = 500;
 
 pub struct GoogleWebTranslateJob<'a> {
     pub provider_url: &'a str,
@@ -17,7 +22,12 @@ pub struct GoogleWebTranslateJob<'a> {
 }
 
 pub fn build_google_client(use_proxy: bool, timeout_sec: u64) -> Result<Client, String> {
-    let builder = Client::builder().timeout(Duration::from_secs(timeout_sec.max(1)));
+    let builder = Client::builder()
+        .use_native_tls()
+        .http1_only()
+        .timeout(Duration::from_secs(timeout_sec.max(1)))
+        .pool_max_idle_per_host(0)
+        .user_agent(GOOGLE_WEB_USER_AGENT);
     let (builder, proxy_display) = system_proxy::apply_to_blocking_builder(builder, use_proxy)?;
     if let Some(proxy) = proxy_display {
         log::info!(target: "subforge_google", "google_web_proxy={proxy}");
@@ -33,6 +43,7 @@ pub fn translate_all_cues_google(
     cues: &[SubCue],
     mut pause_requested: impl FnMut() -> bool,
     mut on_progress: impl FnMut(usize, usize),
+    mut on_item_done: impl FnMut(usize, &str),
 ) -> Result<Vec<String>, String> {
     if cues.is_empty() {
         return Ok(Vec::new());
@@ -50,13 +61,70 @@ pub fn translate_all_cues_google(
             return Err("__pause__".into());
         }
         if idx > 0 && job.min_interval_ms > 0 {
-            std::thread::sleep(Duration::from_millis(job.min_interval_ms));
+            if sleep_with_abort(
+                Duration::from_millis(job.min_interval_ms),
+                &mut pause_requested,
+            ) {
+                return Err("__pause__".into());
+            }
         }
-        let translated = translate_one(client, &url, job.use_proxy, &sl, &tl, &cue.text)?;
+
+        let mut last_err: Option<String> = None;
+        let mut translated: Option<String> = None;
+        for attempt in 0..=GOOGLE_TRANSLATE_MAX_RETRIES {
+            if attempt > 0 {
+                let wait = GOOGLE_TRANSLATE_BACKOFF_BASE_MS
+                    .saturating_mul(1u64 << (attempt - 1).min(5));
+                log::warn!(
+                    target: "subforge_google",
+                    "google translate retry cue#{} attempt={} wait_ms={} last_err={}",
+                    cue.index,
+                    attempt,
+                    wait,
+                    last_err.as_deref().unwrap_or("")
+                );
+                if sleep_with_abort(Duration::from_millis(wait), &mut pause_requested) {
+                    return Err("__pause__".into());
+                }
+            }
+            match translate_one(client, &url, job.use_proxy, &sl, &tl, &cue.text) {
+                Ok(t) => {
+                    translated = Some(t);
+                    break;
+                }
+                Err(GoogleSendError::Retriable(msg)) => last_err = Some(msg),
+                Err(GoogleSendError::Fatal(msg)) => return Err(msg),
+            }
+        }
+        let translated = translated.ok_or_else(|| {
+            last_err
+                .map(|m| format!("Google 翻译重试 {} 次仍失败：{}", GOOGLE_TRANSLATE_MAX_RETRIES, m))
+                .unwrap_or_else(|| "Google 翻译失败".into())
+        })?;
+        on_item_done(idx, &translated);
         out.push(translated);
         on_progress(idx + 1, cues.len());
     }
     Ok(out)
+}
+
+fn sleep_with_abort(total: Duration, pause_requested: &mut impl FnMut() -> bool) -> bool {
+    let step = Duration::from_millis(100);
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if pause_requested() {
+            return true;
+        }
+        let chunk = remaining.min(step);
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    pause_requested()
+}
+
+enum GoogleSendError {
+    Retriable(String),
+    Fatal(String),
 }
 
 pub(crate) fn effective_google_url(provider_url: &str) -> String {
@@ -84,7 +152,7 @@ fn translate_one(
     source_lang: &str,
     target_lang: &str,
     text: &str,
-) -> Result<String, String> {
+) -> Result<String, GoogleSendError> {
     let resp = client
         .get(format!(
             "{}?client=gtx&sl={}&tl={}&dt=t&q={}",
@@ -94,17 +162,36 @@ fn translate_one(
             urlencoding::encode(text)
         ))
         .send()
-        .map_err(|e| format_google_request_error(&e, url, use_proxy))?;
+        .map_err(|e| GoogleSendError::Retriable(format_google_request_error(&e, url, use_proxy)))?;
     let status = resp.status();
-    let body = resp.text().unwrap_or_default();
+    let body = resp
+        .text()
+        .map_err(|e| GoogleSendError::Retriable(format!("Google 翻译读取响应失败: {}", format_error_chain(&e))))?;
     if !status.is_success() {
-        return Err(format!(
+        let msg = format!(
             "Google 翻译 HTTP {}: {}",
             status.as_u16(),
             body.chars().take(300).collect::<String>()
-        ));
+        );
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(GoogleSendError::Retriable(msg));
+        }
+        return Err(GoogleSendError::Fatal(msg));
     }
-    parse_google_body(&body)
+    parse_google_body(&body).map_err(GoogleSendError::Fatal)
+}
+
+pub(crate) fn format_error_chain<E: StdError + ?Sized>(err: &E) -> String {
+    let mut parts: Vec<String> = vec![err.to_string()];
+    let mut src: Option<&dyn StdError> = err.source();
+    while let Some(s) = src {
+        let msg = s.to_string();
+        if parts.last().map(|prev| prev != &msg).unwrap_or(true) {
+            parts.push(msg);
+        }
+        src = s.source();
+    }
+    parts.join(" | 原因: ")
 }
 
 pub(crate) fn format_google_request_error(
@@ -112,7 +199,7 @@ pub(crate) fn format_google_request_error(
     url: &str,
     use_proxy: bool,
 ) -> String {
-    let detail = err.to_string();
+    let detail = format_error_chain(err);
     if err.is_timeout() {
         if use_proxy {
             return format!(

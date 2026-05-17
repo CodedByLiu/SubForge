@@ -58,6 +58,12 @@ pub struct WhisperConfig {
     pub mirror_url: String,
     #[serde(default = "default_true")]
     pub prefer_mirror: bool,
+    /// 识别术语表：`source` = Whisper 经常输出的错误写法，`target` = 期望的正确拼写。
+    /// 同时驱动 whisper.cpp `--prompt`（用 target 写法引导模型）与转录后强制替换（source → target）。
+    #[serde(default)]
+    pub recognition_glossary: Vec<GlossaryEntry>,
+    #[serde(default)]
+    pub recognition_glossary_case_sensitive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +230,8 @@ impl Default for AppConfig {
                 download_url: String::new(),
                 mirror_url: String::new(),
                 prefer_mirror: true,
+                recognition_glossary: Vec::new(),
+                recognition_glossary_case_sensitive: false,
             },
             translate: TranslateConfig {
                 source_lang: "auto".into(),

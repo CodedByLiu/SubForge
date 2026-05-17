@@ -3,15 +3,18 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  clearCache,
   deleteWhisperModel,
   downloadWhisperModel,
   getAppInfo,
+  getCacheStats,
   getConfig,
   getHardwareInfo,
   listWhisperModels,
   saveConfig,
   testGoogleWebConnection,
   testLlmConnection,
+  type CacheStatsDto,
   type SaveConfigPayload,
 } from "@/services/ipc";
 import { checkTranscribeDeps } from "@/services/tasksIpc";
@@ -77,6 +80,9 @@ export function SettingsPage() {
   const [depsResult, setDepsResult] = useState<TranscribeDepsCheck | null>(null);
   const [runtimeProgress, setRuntimeProgress] =
     useState<WhisperRuntimeProgress | null>(null);
+  const [cacheStats, setCacheStats] = useState<CacheStatsDto | null>(null);
+  const [cacheBusy, setCacheBusy] = useState(false);
+  const [cacheMsg, setCacheMsg] = useState<string | null>(null);
   const useGpuRef = useRef(cfg.whisper.use_gpu);
   useGpuRef.current = cfg.whisper.use_gpu;
 
@@ -115,6 +121,44 @@ export function SettingsPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const refreshCacheStats = useCallback(async () => {
+    try {
+      setCacheStats(await getCacheStats());
+    } catch (e) {
+      setCacheMsg(`读取缓存信息失败：${String(e)}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshCacheStats();
+  }, [refreshCacheStats]);
+
+  const onClearCache = async (olderThanDays: number) => {
+    const totalMb = cacheStats ? cacheStats.total_bytes / 1024 / 1024 : 0;
+    const desc = olderThanDays > 0 ? `清理超过 ${olderThanDays} 天未访问的缓存` : "清理全部任务缓存";
+    const warn =
+      olderThanDays > 0
+        ? ""
+        : "（运行中或失败待重试的任务缓存将一并删除，下次会从头重跑）";
+    const ok = await confirm(`${desc}？当前共占用约 ${totalMb.toFixed(1)} MB。${warn}`, {
+      title: "SubForge",
+      kind: "warning",
+    });
+    if (!ok) return;
+    setCacheBusy(true);
+    setCacheMsg(null);
+    try {
+      const res = await clearCache(olderThanDays);
+      const mb = (res.freed_bytes / 1024 / 1024).toFixed(1);
+      setCacheMsg(`已删除 ${res.deleted_count} 个缓存目录，释放约 ${mb} MB。`);
+      await refreshCacheStats();
+    } catch (e) {
+      setCacheMsg(`清理失败：${String(e)}`);
+    } finally {
+      setCacheBusy(false);
+    }
+  };
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -271,6 +315,26 @@ export function SettingsPage() {
   const removeGlossary = (i: number) => {
     const g = cfg.translate.glossary.filter((_, j) => j !== i);
     setTranslate({ glossary: g });
+  };
+
+  const addRecognitionGlossaryRow = () => {
+    setWhisper({
+      recognition_glossary: [
+        ...cfg.whisper.recognition_glossary,
+        { source: "", target: "", note: "" },
+      ],
+    });
+  };
+
+  const patchRecognitionGlossary = (i: number, row: Partial<GlossaryEntry>) => {
+    const g = [...cfg.whisper.recognition_glossary];
+    g[i] = { ...g[i], ...row };
+    setWhisper({ recognition_glossary: g });
+  };
+
+  const removeRecognitionGlossary = (i: number) => {
+    const g = cfg.whisper.recognition_glossary.filter((_, j) => j !== i);
+    setWhisper({ recognition_glossary: g });
   };
 
   return (
@@ -969,6 +1033,86 @@ export function SettingsPage() {
             </p>
           </div>
         )}
+        <div style={{ marginTop: "1rem" }}>
+          <h3 style={{ fontSize: "0.95rem", margin: "0 0 0.35rem" }}>识别术语表</h3>
+          <p className="muted" style={{ margin: "0 0 0.5rem", fontSize: "0.8rem" }}>
+            纠正 Whisper 对专业术语的错识。「错误识别」填写经常输出的错误写法（如 <code>Claud</code>、<code>ClaudCode</code>），「正确拼写」填写期望的正确写法（如 <code>Claude</code>、<code>ClaudeCode</code>）。术语会同时作为 Whisper 的识别提示词（引导模型偏向正确写法），并在转录完成后强制替换。
+          </p>
+          <label
+            className="field"
+            style={{ flexDirection: "row", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}
+          >
+            <input
+              type="checkbox"
+              checked={cfg.whisper.recognition_glossary_case_sensitive}
+              onChange={(e) =>
+                setWhisper({ recognition_glossary_case_sensitive: e.target.checked })
+              }
+            />
+            <span>区分大小写</span>
+          </label>
+          <div className="row-actions" style={{ marginBottom: "0.5rem" }}>
+            <button type="button" onClick={addRecognitionGlossaryRow}>
+              添加术语行
+            </button>
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table
+              style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}
+            >
+              <thead>
+                <tr style={{ textAlign: "left", color: "var(--muted)" }}>
+                  <th style={{ padding: "0.35rem" }}>错误识别</th>
+                  <th style={{ padding: "0.35rem" }}>正确拼写</th>
+                  <th style={{ padding: "0.35rem" }}>备注</th>
+                  <th style={{ padding: "0.35rem" }} />
+                </tr>
+              </thead>
+              <tbody>
+                {cfg.whisper.recognition_glossary.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="muted" style={{ padding: "0.5rem" }}>
+                      暂无术语。点击「添加术语行」可录入；全部留空不影响任务运行。
+                    </td>
+                  </tr>
+                ) : null}
+                {cfg.whisper.recognition_glossary.map((row, i) => (
+                  <tr key={i}>
+                    <td style={{ padding: "0.25rem" }}>
+                      <input
+                        value={row.source}
+                        onChange={(e) =>
+                          patchRecognitionGlossary(i, { source: e.target.value })
+                        }
+                      />
+                    </td>
+                    <td style={{ padding: "0.25rem" }}>
+                      <input
+                        value={row.target}
+                        onChange={(e) =>
+                          patchRecognitionGlossary(i, { target: e.target.value })
+                        }
+                      />
+                    </td>
+                    <td style={{ padding: "0.25rem" }}>
+                      <input
+                        value={row.note}
+                        onChange={(e) =>
+                          patchRecognitionGlossary(i, { note: e.target.value })
+                        }
+                      />
+                    </td>
+                    <td style={{ padding: "0.25rem" }}>
+                      <button type="button" onClick={() => removeRecognitionGlossary(i)}>
+                        删除
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
       <section className="card">
@@ -1293,6 +1437,47 @@ export function SettingsPage() {
             />
           </label>
         </div>
+      </section>
+
+      <section className="card">
+        <h2>缓存管理</h2>
+        <p className="muted" style={{ marginTop: 0 }}>
+          任务运行时产生的音频、识别结果与翻译增量都缓存在{" "}
+          <code>cache/</code> 子目录下，用于断点续传。任务成功完成会自动清理；失败或中断保留以便重试。
+        </p>
+        <div className="muted" style={{ marginBottom: "0.6rem" }}>
+          {cacheStats
+            ? `当前共 ${cacheStats.entry_count} 个任务缓存，占用约 ${(cacheStats.total_bytes / 1024 / 1024).toFixed(1)} MB。`
+            : "正在读取缓存信息…"}
+        </div>
+        <div className="row-actions">
+          <button
+            type="button"
+            disabled={cacheBusy || !cacheStats || cacheStats.entry_count === 0}
+            onClick={() => void onClearCache(7)}
+          >
+            清理 7 天前的缓存
+          </button>
+          <button
+            type="button"
+            disabled={cacheBusy || !cacheStats || cacheStats.entry_count === 0}
+            onClick={() => void onClearCache(0)}
+          >
+            清理全部缓存
+          </button>
+          <button
+            type="button"
+            disabled={cacheBusy}
+            onClick={() => void refreshCacheStats()}
+          >
+            刷新
+          </button>
+        </div>
+        {cacheMsg ? (
+          <div className="muted" style={{ marginTop: "0.6rem" }}>
+            {cacheMsg}
+          </div>
+        ) : null}
       </section>
 
       <section className="card">

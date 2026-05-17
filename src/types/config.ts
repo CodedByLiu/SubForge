@@ -27,6 +27,8 @@ export interface WhisperConfig {
   download_url: string;
   mirror_url: string;
   prefer_mirror: boolean;
+  recognition_glossary: GlossaryEntry[];
+  recognition_glossary_case_sensitive: boolean;
 }
 
 export interface GlossaryEntry {
@@ -122,6 +124,8 @@ export function defaultAppConfig(): AppConfig {
       download_url: "",
       mirror_url: "",
       prefer_mirror: true,
+      recognition_glossary: [],
+      recognition_glossary_case_sensitive: false,
     },
     translate: {
       source_lang: "auto",

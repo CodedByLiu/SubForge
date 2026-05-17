@@ -1,8 +1,13 @@
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use serde_json::Value;
 use which::which;
 
+use super::process::apply_windows_no_window;
 use super::whisper_runtime::managed_whisper_dir;
 
 #[derive(Debug, Clone)]
@@ -80,7 +85,18 @@ fn is_valid_whisper_candidate(path: &Path) -> bool {
     }
 }
 
-/// whisper.cpp: `-of` 为不含扩展名的前缀；在工作目录下生成 `.srt` / `.json`
+pub type ProgressCallback = Arc<Mutex<dyn FnMut(u8) + Send>>;
+
+/// 包装一个 FnMut 闭包成可在多线程间共享的 ProgressCallback。
+pub fn boxed_progress<F>(f: F) -> ProgressCallback
+where
+    F: FnMut(u8) + Send + 'static,
+{
+    Arc::new(Mutex::new(f))
+}
+
+/// whisper.cpp: `-of` 为不含扩展名的前缀；在工作目录下生成 `.srt` / `.json`。
+/// 第一次运行（SRT）映射进度到 0-50，第二次（JSON）映射到 50-100。
 pub fn run_whisper_srt_json(
     cli: &Path,
     model: &Path,
@@ -90,6 +106,8 @@ pub fn run_whisper_srt_json(
     force_cpu: bool,
     out_prefix: &Path,
     vad: Option<&WhisperVadOptions<'_>>,
+    initial_prompt: Option<&str>,
+    progress: Option<ProgressCallback>,
 ) -> Result<(), String> {
     let work_dir = out_prefix
         .parent()
@@ -111,7 +129,7 @@ pub fn run_whisper_srt_json(
         }
     };
 
-    let mut cmd = std::process::Command::new(cli);
+    let mut cmd = Command::new(cli);
     cmd.current_dir(work_dir);
     cmd.arg("-m").arg(model);
     cmd.arg("-f").arg(wav);
@@ -129,12 +147,21 @@ pub fn run_whisper_srt_json(
         cmd.arg("-vmsd")
             .arg(format!("{:.3}", vad.max_segment_ms as f64 / 1000.0));
     }
+    if progress.is_some() {
+        cmd.arg("--print-progress");
+    }
+    if let Some(prompt) = initial_prompt {
+        let trimmed = prompt.trim();
+        if !trimmed.is_empty() {
+            cmd.arg("--prompt").arg(trimmed);
+        }
+    }
     cmd.arg("-osrt");
     cmd.arg("-of").arg(&prefix_name);
 
-    run_whisper_command(cmd)?;
+    run_whisper_command(cmd, progress.clone(), 0, 50)?;
 
-    let mut json_cmd = std::process::Command::new(cli);
+    let mut json_cmd = Command::new(cli);
     json_cmd.current_dir(work_dir);
     json_cmd.arg("-m").arg(model);
     json_cmd.arg("-f").arg(wav);
@@ -153,26 +180,137 @@ pub fn run_whisper_srt_json(
             .arg("-vmsd")
             .arg(format!("{:.3}", vad.max_segment_ms as f64 / 1000.0));
     }
+    if progress.is_some() {
+        json_cmd.arg("--print-progress");
+    }
+    if let Some(prompt) = initial_prompt {
+        let trimmed = prompt.trim();
+        if !trimmed.is_empty() {
+            json_cmd.arg("--prompt").arg(trimmed);
+        }
+    }
     json_cmd.arg("-ml").arg("1");
     json_cmd.arg("-sow");
     json_cmd.arg("-ojf");
     json_cmd.arg("-of").arg(&prefix_name);
 
-    run_whisper_command(json_cmd)?;
+    run_whisper_command(json_cmd, progress, 50, 50)?;
     Ok(())
 }
 
-fn run_whisper_command(mut cmd: std::process::Command) -> Result<(), String> {
-    let out = cmd
-        .output()
+/// 在 stderr 行中解析 whisper.cpp 的进度输出：
+/// `whisper_print_progress_callback: progress = 50%`
+fn parse_progress_line(line: &str) -> Option<u8> {
+    let idx = line.find("progress")?;
+    let after = &line[idx + "progress".len()..];
+    let eq = after.find('=')?;
+    let tail = after[eq + 1..].trim_start();
+    let mut digits = String::new();
+    for c in tail.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok().map(|n| n.min(100) as u8)
+}
+
+fn run_whisper_command(
+    mut cmd: Command,
+    progress: Option<ProgressCallback>,
+    base_pct: u8,
+    span_pct: u8,
+) -> Result<(), String> {
+    apply_windows_no_window(&mut cmd);
+
+    if progress.is_none() {
+        // 无回调：保持原一次性输出捕获行为
+        let out = cmd
+            .output()
+            .map_err(|e| format!("启动 Whisper 失败: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let mut msg = String::from_utf8_lossy(&out.stderr).to_string();
+        if msg.trim().is_empty() {
+            msg = String::from_utf8_lossy(&out.stdout).to_string();
+        }
+        let msg: String = msg.chars().take(4000).collect();
+        return Err(format!("Whisper 识别失败: {msg}"));
+    }
+
+    let progress = progress.unwrap();
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("启动 Whisper 失败: {e}"))?;
-    if out.status.success() {
+
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+
+    let progress_cb = progress.clone();
+    let err_thread = stderr.map(|stderr| {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let mut last_emit: i16 = -1;
+            let mut tail = String::new();
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(pct) = parse_progress_line(&line) {
+                    if (pct as i16) > last_emit {
+                        last_emit = pct as i16;
+                        let mapped = base_pct.saturating_add(
+                            ((pct as u32 * span_pct as u32) / 100u32) as u8,
+                        );
+                        if let Ok(mut cb) = progress_cb.lock() {
+                            cb(mapped.min(base_pct.saturating_add(span_pct)));
+                        }
+                    }
+                }
+                tail.push_str(&line);
+                tail.push('\n');
+                if tail.len() > 32 * 1024 {
+                    let cut = tail.len() - 16 * 1024;
+                    tail = tail.split_off(cut);
+                }
+            }
+            tail
+        })
+    });
+
+    let out_thread = stdout.map(|mut stdout| {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = stdout.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("等待 Whisper 退出失败: {e}"))?;
+
+    let stderr_text = err_thread
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stdout_text = out_thread
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if status.success() {
+        if let Ok(mut cb) = progress.lock() {
+            cb(base_pct.saturating_add(span_pct).min(100));
+        }
         return Ok(());
     }
 
-    let mut msg = String::from_utf8_lossy(&out.stderr).to_string();
+    let mut msg = stderr_text;
     if msg.trim().is_empty() {
-        msg = String::from_utf8_lossy(&out.stdout).to_string();
+        msg = stdout_text;
     }
     let msg: String = msg.chars().take(4000).collect();
     Err(format!("Whisper 识别失败: {msg}"))
@@ -205,8 +343,33 @@ fn normalize_lang_token(s: &str) -> String {
     }
 }
 
-pub fn expected_whisper_sidecar_paths(prefix: &Path) -> (PathBuf, PathBuf) {
-    let srt = prefix.with_extension("srt");
-    let json = prefix.with_extension("json");
-    (srt, json)
+#[cfg(test)]
+mod tests {
+    use super::parse_progress_line;
+
+    #[test]
+    fn parse_progress_basic() {
+        assert_eq!(
+            parse_progress_line("whisper_print_progress_callback: progress = 50%"),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn parse_progress_with_spaces() {
+        assert_eq!(
+            parse_progress_line("foo bar: progress =   7%"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn parse_progress_ignores_non_progress_lines() {
+        assert_eq!(parse_progress_line("whisper: loading model"), None);
+    }
+
+    #[test]
+    fn parse_progress_clamps_to_100() {
+        assert_eq!(parse_progress_line("progress = 123%"), Some(100));
+    }
 }

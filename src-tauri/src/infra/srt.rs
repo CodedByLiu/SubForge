@@ -1,6 +1,8 @@
 //! Minimal SRT parsing and formatting, plus subtitle post-processing helpers.
 
-#[derive(Debug, Clone)]
+use crate::domain::config::GlossaryEntry;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubCue {
     pub index: u32,
     pub start_ms: i64,
@@ -376,6 +378,177 @@ pub fn normalize_cues_for_srt(cues: &[SubCue]) -> Vec<SubCue> {
     out
 }
 
+/// 按识别术语表对转录文本做强制替换。
+///
+/// - 长 `source` 优先替换，避免短词破坏已经替换好的长术语。
+/// - 全 ASCII 的 `source` 走"词边界"匹配（前后字符若是 ASCII alphanumeric/`_` 则视为词内，不替换），
+///   避免 `Claud → Claude` 时把 `Claudia` 改成 `Claudeia`。
+/// - 含 CJK 等非 ASCII 字符的 `source` 直接子串替换（CJK 无词边界概念）。
+/// - 空 `source` / 空 `target` 跳过，避免误删文本。
+pub fn apply_recognition_glossary(
+    cues: &mut [SubCue],
+    glossary: &[GlossaryEntry],
+    case_sensitive: bool,
+) {
+    let mut entries: Vec<(String, String, bool)> = glossary
+        .iter()
+        .filter_map(|e| {
+            let src = e.source.trim();
+            let tgt = e.target.trim();
+            if src.is_empty() || tgt.is_empty() || src == tgt {
+                return None;
+            }
+            let ascii = src.chars().all(|c| c.is_ascii());
+            Some((src.to_string(), tgt.to_string(), ascii))
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+
+    for cue in cues.iter_mut() {
+        for (src, tgt, ascii) in &entries {
+            if *ascii {
+                cue.text = replace_ascii_word(&cue.text, src, tgt, case_sensitive);
+            } else {
+                cue.text = replace_substring(&cue.text, src, tgt, case_sensitive);
+            }
+        }
+    }
+}
+
+fn is_ascii_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn replace_ascii_word(haystack: &str, needle: &str, replacement: &str, case_sensitive: bool) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let hay_cmp = if case_sensitive {
+        haystack.to_string()
+    } else {
+        haystack.to_ascii_lowercase()
+    };
+    let needle_cmp = if case_sensitive {
+        needle.to_string()
+    } else {
+        needle.to_ascii_lowercase()
+    };
+    let mut out = String::with_capacity(haystack.len());
+    let mut cursor = 0usize;
+    let bytes = haystack.as_bytes();
+    while cursor <= hay_cmp.len() {
+        match hay_cmp[cursor..].find(&needle_cmp) {
+            Some(rel) => {
+                let abs = cursor + rel;
+                let before_ok = if abs == 0 {
+                    true
+                } else {
+                    // 前一个字符若是 ASCII 词字符，则在词中部
+                    !bytes
+                        .get(abs - 1)
+                        .map(|&b| (b as char).is_ascii() && is_ascii_word_char(b as char))
+                        .unwrap_or(false)
+                };
+                let end = abs + needle_cmp.len();
+                let after_ok = if end >= bytes.len() {
+                    true
+                } else {
+                    !bytes
+                        .get(end)
+                        .map(|&b| (b as char).is_ascii() && is_ascii_word_char(b as char))
+                        .unwrap_or(false)
+                };
+                out.push_str(&haystack[cursor..abs]);
+                if before_ok && after_ok {
+                    out.push_str(replacement);
+                } else {
+                    out.push_str(&haystack[abs..end]);
+                }
+                cursor = end;
+                if rel == 0 && needle_cmp.is_empty() {
+                    break;
+                }
+            }
+            None => {
+                out.push_str(&haystack[cursor..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn replace_substring(haystack: &str, needle: &str, replacement: &str, case_sensitive: bool) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    if case_sensitive {
+        return haystack.replace(needle, replacement);
+    }
+    let hay_lower = haystack.to_lowercase();
+    let needle_lower = needle.to_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut cursor = 0usize;
+    while cursor <= hay_lower.len() {
+        match hay_lower[cursor..].find(&needle_lower) {
+            Some(rel) => {
+                let abs = cursor + rel;
+                let end = abs + needle_lower.len();
+                out.push_str(&haystack[cursor..abs]);
+                out.push_str(replacement);
+                cursor = end;
+            }
+            None => {
+                out.push_str(&haystack[cursor..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 把识别术语表拼成 whisper.cpp 用的 initial prompt。
+/// 按 UTF-8 字符长度裁剪到 ~800（粗略对应 ~200 tokens 安全线），避免超过模型上下文上限。
+pub fn build_recognition_prompt(glossary: &[GlossaryEntry]) -> Option<String> {
+    const PROMPT_PREFIX: &str = "Vocabulary: ";
+    const MAX_CHARS: usize = 800;
+    let mut parts: Vec<String> = Vec::new();
+    for e in glossary {
+        let s = e.source.trim();
+        let t = e.target.trim();
+        if s.is_empty() || t.is_empty() {
+            continue;
+        }
+        if !parts.iter().any(|p| p == t) {
+            parts.push(t.to_string());
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    let prefix_len = PROMPT_PREFIX.chars().count();
+    for term in parts {
+        let sep_len = if body.is_empty() { 0 } else { 2 };
+        let term_len = term.chars().count();
+        if prefix_len + body.chars().count() + sep_len + term_len > MAX_CHARS {
+            break;
+        }
+        if !body.is_empty() {
+            body.push_str(", ");
+        }
+        body.push_str(&term);
+    }
+    if body.is_empty() {
+        None
+    } else {
+        Some(format!("{}{}", PROMPT_PREFIX, body))
+    }
+}
+
 pub fn format_srt(cues: &[SubCue]) -> String {
     let normalized = normalize_cues_for_srt(cues);
     let mut s = String::new();
@@ -483,9 +656,110 @@ pub fn build_bilingual_cues_optimized(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_bilingual_cues_optimized, normalize_cues_for_srt, optimize_source_cues,
-        optimize_translated_cues, SubCue,
+        apply_recognition_glossary, build_bilingual_cues_optimized, build_recognition_prompt,
+        normalize_cues_for_srt, optimize_source_cues, optimize_translated_cues, SubCue,
     };
+    use crate::domain::config::GlossaryEntry;
+
+    fn cue(text: &str) -> SubCue {
+        SubCue {
+            index: 1,
+            start_ms: 0,
+            end_ms: 1000,
+            text: text.into(),
+        }
+    }
+
+    fn entry(source: &str, target: &str) -> GlossaryEntry {
+        GlossaryEntry {
+            source: source.into(),
+            target: target.into(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn recognition_glossary_replaces_ascii_with_word_boundary() {
+        let mut cues = vec![cue("I love Claud but Claudia is here")];
+        apply_recognition_glossary(&mut cues, &[entry("Claud", "Claude")], false);
+        assert_eq!(cues[0].text, "I love Claude but Claudia is here");
+    }
+
+    #[test]
+    fn recognition_glossary_prefers_longer_source() {
+        let mut cues = vec![cue("ClaudCode and Claud are different")];
+        apply_recognition_glossary(
+            &mut cues,
+            &[entry("Claud", "Claude"), entry("ClaudCode", "ClaudeCode")],
+            false,
+        );
+        assert_eq!(cues[0].text, "ClaudeCode and Claude are different");
+    }
+
+    #[test]
+    fn recognition_glossary_case_insensitive_by_default() {
+        let mut cues = vec![cue("claud and CLAUD here")];
+        apply_recognition_glossary(&mut cues, &[entry("Claud", "Claude")], false);
+        assert_eq!(cues[0].text, "Claude and Claude here");
+    }
+
+    #[test]
+    fn recognition_glossary_case_sensitive_when_enabled() {
+        let mut cues = vec![cue("claud and Claud here")];
+        apply_recognition_glossary(&mut cues, &[entry("Claud", "Claude")], true);
+        assert_eq!(cues[0].text, "claud and Claude here");
+    }
+
+    #[test]
+    fn recognition_glossary_replaces_cjk_substring() {
+        let mut cues = vec![cue("克劳德是个好工具，但克劳德也有限")];
+        apply_recognition_glossary(&mut cues, &[entry("克劳德", "Claude")], false);
+        assert_eq!(cues[0].text, "Claude是个好工具，但Claude也有限");
+    }
+
+    #[test]
+    fn recognition_glossary_skips_empty_entries() {
+        let mut cues = vec![cue("hello world")];
+        apply_recognition_glossary(
+            &mut cues,
+            &[entry("", "X"), entry("hello", ""), entry("world", "world")],
+            false,
+        );
+        assert_eq!(cues[0].text, "hello world");
+    }
+
+    #[test]
+    fn build_prompt_basic() {
+        let glossary = vec![
+            entry("Claud", "Claude"),
+            entry("ClaudCode", "ClaudeCode"),
+            entry("", "Skipped"),
+        ];
+        let prompt = build_recognition_prompt(&glossary).unwrap();
+        assert_eq!(prompt, "Vocabulary: Claude, ClaudeCode");
+    }
+
+    #[test]
+    fn build_prompt_dedupes_target() {
+        let glossary = vec![entry("a", "Claude"), entry("b", "Claude")];
+        let prompt = build_recognition_prompt(&glossary).unwrap();
+        assert_eq!(prompt, "Vocabulary: Claude");
+    }
+
+    #[test]
+    fn build_prompt_truncates_to_safe_length() {
+        let glossary: Vec<GlossaryEntry> = (0..200)
+            .map(|i| entry(&format!("s{i}"), &format!("Term{i:04}")))
+            .collect();
+        let prompt = build_recognition_prompt(&glossary).unwrap();
+        assert!(prompt.chars().count() <= 800);
+    }
+
+    #[test]
+    fn build_prompt_returns_none_when_empty() {
+        assert!(build_recognition_prompt(&[]).is_none());
+        assert!(build_recognition_prompt(&[entry("a", "")]).is_none());
+    }
 
     #[test]
     fn normalize_removes_adjacent_overlaps() {

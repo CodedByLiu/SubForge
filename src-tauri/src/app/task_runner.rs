@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,18 +16,19 @@ use crate::domain::task::{
     TRANSLATION_STAGE_NOT_REQUIRED, TRANSLATION_STAGE_QUEUED, TRANSLATION_STAGE_TRANSLATING,
     TRANSLATION_STAGE_WAITING_ORIGINAL,
 };
+use crate::infra::cache::{hash_parts, TaskCache};
 use crate::infra::config_store;
 use crate::infra::ffmpeg_tool::{extract_mono_16k_wav, resolve_ffmpeg};
 use crate::infra::google_translate::{
     build_google_client, translate_all_cues_google, GoogleWebTranslateJob,
 };
 use crate::infra::llm_translate::{translate_all_cues, TranslateJob};
-use crate::infra::paths::temp_dir;
 use crate::infra::runner_limits::{effective_max_parallel_tasks, LlmRequestSlots};
 use crate::infra::secrets;
 use crate::infra::srt::{
-    build_bilingual_cues_optimized, build_translated_cues, format_srt, optimize_source_cues,
-    optimize_translated_cues, parse_srt,
+    apply_recognition_glossary, build_bilingual_cues_optimized, build_recognition_prompt,
+    build_translated_cues, format_srt, optimize_source_cues, optimize_translated_cues, parse_srt,
+    SubCue,
 };
 use crate::infra::subtitle_output::{resolve_bilingual_srt_path, resolve_original_srt_path};
 use crate::infra::subtitle_segmentation::{segment_cues, SegmentationJob};
@@ -35,7 +36,7 @@ use crate::infra::task_store;
 use crate::infra::whisper_models::model_file_path;
 use crate::infra::whisper_runtime;
 use crate::infra::whisper_tool::{
-    expected_whisper_sidecar_paths, read_language_from_whisper_json, resolve_whisper_cli,
+    boxed_progress, read_language_from_whisper_json, resolve_whisper_cli,
     run_whisper_srt_json, WhisperVadOptions,
 };
 
@@ -119,49 +120,29 @@ fn update_task_runtime_state(
     }
 }
 
-fn run_with_progress_heartbeat<T, F>(
+/// 把后端任务进度写入 task store 并广播 task-progress 事件。
+fn push_progress(
+    app: &AppHandle,
     ts: &Arc<Mutex<TaskStoreFile>>,
     root: &AppRoot,
     task_id: &str,
+    progress: u8,
     phase: &str,
-    max_progress: u8,
-    action: F,
-) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String>,
-{
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = stop.clone();
-    let ts_hb = ts.clone();
-    let root_hb = root.clone();
-    let task_id_hb = task_id.to_string();
-    let phase_hb = phase.to_string();
-    let handle = std::thread::spawn(move || {
-        while !stop_flag.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(1500));
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
+) {
+    {
+        let mut g = lock_task_store(ts, "push_progress");
+        if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
+            if t.progress != progress || t.phase != phase {
+                t.progress = progress;
+                if !phase.is_empty() {
+                    t.phase = phase.into();
+                }
+                t.updated_at_ms = now_ms();
+                let _ = task_store::save_task_store_file(&root.0, &g);
             }
-            let mut g = lock_task_store(&ts_hb, "run_with_progress_heartbeat");
-            let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id_hb) else {
-                break;
-            };
-            if t.progress >= max_progress {
-                continue;
-            }
-            if t.phase.is_empty() {
-                t.phase = phase_hb.clone();
-            }
-            t.progress = (t.progress + 1).min(max_progress);
-            t.updated_at_ms = now_ms();
-            let _ = task_store::save_task_store_file(&root_hb.0, &g);
         }
-    });
-
-    let result = action();
-    stop.store(true, Ordering::Relaxed);
-    let _ = handle.join();
-    result
+    }
+    emit_progress(app, task_id, STATUS_RUNNING, progress, phase);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,6 +347,8 @@ struct JobSnapshot {
     glossary_case_sensitive: bool,
     glossary: Vec<GlossaryEntry>,
     translate_concurrency: u32,
+    recognition_glossary: Vec<GlossaryEntry>,
+    recognition_glossary_case_sensitive: bool,
 }
 
 fn load_job(ts: &Arc<Mutex<TaskStoreFile>>, task_id: &str, cfg: &AppConfig) -> Option<JobSnapshot> {
@@ -536,6 +519,8 @@ fn load_job(ts: &Arc<Mutex<TaskStoreFile>>, task_id: &str, cfg: &AppConfig) -> O
         } else {
             cfg.llm.translate_concurrency
         },
+        recognition_glossary: cfg.whisper.recognition_glossary.clone(),
+        recognition_glossary_case_sensitive: cfg.whisper.recognition_glossary_case_sensitive,
     })
 }
 
@@ -719,132 +704,94 @@ fn run_one_task(
         return;
     }
 
-    let tmp_root = temp_dir(&root.0).join("tasks").join(task_id);
-    let _ = fs::remove_dir_all(&tmp_root);
-    if let Err(e) = fs::create_dir_all(&tmp_root) {
-        fail_task(app, ts, root, task_id, &format!("创建临时目录失败: {e}"));
-        return;
-    }
-    let wav_path = tmp_root.join("audio.wav");
-    let w_prefix = tmp_root.join("w");
-
-    match mid_run_poll(ts, task_id) {
-        MidRun::Continue => {}
-        MidRun::Pause => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            apply_paused(ts, root, task_id, app);
-            return;
-        }
-        MidRun::Cancel => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            remove_task_if_present(app, ts, root, task_id);
-            return;
-        }
-    }
-
-    let ffmpeg = match resolve_ffmpeg(&job.ffmpeg_path) {
-        Ok(p) => p,
+    let mut cache = match TaskCache::open(&root.0, video) {
+        Ok(c) => c,
         Err(e) => {
             fail_task(app, ts, root, task_id, &e);
             return;
         }
     };
 
-    emit_progress(app, task_id, STATUS_RUNNING, 10, "extract_audio");
-    if let Err(e) = extract_mono_16k_wav(&ffmpeg, video, &wav_path) {
-        fail_task(app, ts, root, task_id, &e);
-        let _ = fs::remove_dir_all(&tmp_root);
-        return;
+    macro_rules! check_pause_cancel {
+        () => {
+            match mid_run_poll(ts, task_id) {
+                MidRun::Continue => {}
+                MidRun::Pause => {
+                    apply_paused(ts, root, task_id, app);
+                    return;
+                }
+                MidRun::Cancel => {
+                    cache.cleanup();
+                    remove_task_if_present(app, ts, root, task_id);
+                    return;
+                }
+            }
+        };
     }
 
-    match mid_run_poll(ts, task_id) {
-        MidRun::Continue => {}
-        MidRun::Pause => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            apply_paused(ts, root, task_id, app);
-            return;
-        }
-        MidRun::Cancel => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            remove_task_if_present(app, ts, root, task_id);
-            return;
-        }
-    }
+    check_pause_cancel!();
 
-    let model_id = job.whisper_model.trim();
-    let model_path = match model_file_path(&root.0, model_id) {
-        Ok(p) => p,
-        Err(e) => {
-            fail_task(app, ts, root, task_id, &e.to_string());
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    };
-    if !model_path.exists() {
-        fail_task(
-            app,
-            ts,
-            root,
-            task_id,
-            &format!("Whisper 模型未下载: {model_id}（{}）", model_path.display()),
-        );
-        let _ = fs::remove_dir_all(&tmp_root);
-        return;
-    }
-
-    if job.whisper_cli_path.trim().is_empty() {
-        if let Err(e) = whisper_runtime::ensure_managed_whisper_cli(&root.0, |_| {}) {
-            fail_task(
-                app,
-                ts,
-                root,
-                task_id,
-                &format!("自动安装 Whisper CLI 失败: {e}"),
-            );
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    }
-
-    let whisper_cli = match resolve_whisper_cli(&root.0, &job.whisper_cli_path) {
-        Ok(p) => p,
-        Err(e) => {
-            fail_task(app, ts, root, task_id, &e);
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    };
-
-    let vad_model_path = if job.whisper_enable_vad {
-        match whisper_runtime::ensure_managed_whisper_vad_model(
-            &root.0,
-            &cfg.whisper.mirror_url,
-            cfg.whisper.prefer_mirror,
-            &cfg.whisper.download_url,
-            |_| {},
-        ) {
-            Ok(p) => Some(p),
+    // ---------- 阶段 1：抽取音频 ----------
+    let audio_hash = hash_parts(&["audio_16k_mono_v1"]);
+    if cache.audio_valid(&audio_hash) {
+        push_progress(app, ts, root, task_id, 10, "extract_audio");
+    } else {
+        let ffmpeg = match resolve_ffmpeg(&job.ffmpeg_path) {
+            Ok(p) => p,
             Err(e) => {
-                fail_task(
-                    app,
-                    ts,
-                    root,
-                    task_id,
-                    &format!("准备 Whisper VAD 模型失败: {e}"),
-                );
-                let _ = fs::remove_dir_all(&tmp_root);
+                fail_task(app, ts, root, task_id, &e);
                 return;
             }
+        };
+        push_progress(app, ts, root, task_id, 5, "extract_audio");
+        if let Err(e) = extract_mono_16k_wav(&ffmpeg, video, &cache.audio_path()) {
+            fail_task(app, ts, root, task_id, &e);
+            return;
         }
+        if let Err(e) = cache.mark_audio_done(&audio_hash) {
+            fail_task(app, ts, root, task_id, &e);
+            return;
+        }
+        push_progress(app, ts, root, task_id, 10, "extract_audio");
+    }
+
+    check_pause_cancel!();
+
+    // ---------- 阶段 2：Whisper 识别 ----------
+    let p_tr_start = if job.will_translate { 12u8 } else { 15u8 };
+    let recognition_peak = if job.will_translate {
+        44u8
+    } else if job.segmentation_strategy != "disabled" {
+        69u8
     } else {
-        None
+        89u8
     };
 
     let threads = effective_threads(job.cpu_thread_limit, cfg.runtime.cpu_thread_limit);
     let rec_lang = job.recognition_lang.clone();
     let force_cpu = !job.whisper_use_gpu;
+    let model_id = job.whisper_model.trim();
 
-    let p_tr_start = if job.will_translate { 12u8 } else { 15u8 };
+    let vad_signature = if job.whisper_enable_vad {
+        format!(
+            "vad:{:.2}:{}:{}:{}",
+            job.vad_threshold,
+            job.vad_min_speech_ms,
+            job.vad_min_silence_ms,
+            job.vad_max_segment_ms
+        )
+    } else {
+        "vad:off".to_string()
+    };
+    let whisper_hash = hash_parts(&[
+        &audio_hash,
+        model_id,
+        rec_lang.trim(),
+        &threads.to_string(),
+        if force_cpu { "cpu" } else { "gpu" },
+        &vad_signature,
+    ]);
+
     {
         let mut g = lock_task_store(ts, "set_transcribing_state");
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
@@ -873,100 +820,140 @@ fn run_one_task(
         },
     );
 
-    match mid_run_poll(ts, task_id) {
-        MidRun::Continue => {}
-        MidRun::Pause => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            apply_paused(ts, root, task_id, app);
-            return;
-        }
-        MidRun::Cancel => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            remove_task_if_present(app, ts, root, task_id);
-            return;
-        }
-    }
+    check_pause_cancel!();
 
-    let whisper_vad = vad_model_path.as_ref().map(|model_path| WhisperVadOptions {
-        model_path: model_path.as_path(),
-        threshold: job.vad_threshold,
-        min_speech_ms: job.vad_min_speech_ms,
-        min_silence_ms: job.vad_min_silence_ms,
-        max_segment_ms: job.vad_max_segment_ms,
-    });
-
-    let recognition_peak = if job.will_translate {
-        44
-    } else if job.segmentation_strategy != "disabled" {
-        69
+    if cache.whisper_valid(&whisper_hash) {
+        push_progress(app, ts, root, task_id, recognition_peak, "transcribe");
     } else {
-        89
-    };
-    if let Err(e) = run_with_progress_heartbeat(
-        ts,
-        root,
-        task_id,
-        if job.whisper_enable_vad {
-            "vad_detect"
+        let model_path = match model_file_path(&root.0, model_id) {
+            Ok(p) => p,
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &e.to_string());
+                return;
+            }
+        };
+        if !model_path.exists() {
+            fail_task(
+                app,
+                ts,
+                root,
+                task_id,
+                &format!("Whisper 模型未下载: {model_id}（{}）", model_path.display()),
+            );
+            return;
+        }
+
+        if job.whisper_cli_path.trim().is_empty() {
+            if let Err(e) = whisper_runtime::ensure_managed_whisper_cli(&root.0, |_| {}) {
+                fail_task(
+                    app,
+                    ts,
+                    root,
+                    task_id,
+                    &format!("自动安装 Whisper CLI 失败: {e}"),
+                );
+                return;
+            }
+        }
+
+        let whisper_cli = match resolve_whisper_cli(&root.0, &job.whisper_cli_path) {
+            Ok(p) => p,
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &e);
+                return;
+            }
+        };
+
+        let vad_model_path = if job.whisper_enable_vad {
+            match whisper_runtime::ensure_managed_whisper_vad_model(
+                &root.0,
+                &cfg.whisper.mirror_url,
+                cfg.whisper.prefer_mirror,
+                &cfg.whisper.download_url,
+                |_| {},
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    fail_task(
+                        app,
+                        ts,
+                        root,
+                        task_id,
+                        &format!("准备 Whisper VAD 模型失败: {e}"),
+                    );
+                    return;
+                }
+            }
         } else {
-            "transcribe"
-        },
-        recognition_peak,
-        || {
-            run_whisper_srt_json(
-                &whisper_cli,
-                &model_path,
-                &wav_path,
-                &rec_lang,
-                threads,
-                force_cpu,
-                &w_prefix,
-                whisper_vad.as_ref(),
-            )
-        },
-    ) {
-        fail_task(app, ts, root, task_id, &e);
-        let _ = fs::remove_dir_all(&tmp_root);
-        return;
+            None
+        };
+        let whisper_vad = vad_model_path.as_ref().map(|model_path| WhisperVadOptions {
+            model_path: model_path.as_path(),
+            threshold: job.vad_threshold,
+            min_speech_ms: job.vad_min_speech_ms,
+            min_silence_ms: job.vad_min_silence_ms,
+            max_segment_ms: job.vad_max_segment_ms,
+        });
+
+        // 真实进度回调：whisper 内部 0..=100 → 任务进度 p_tr_start..=recognition_peak
+        let app_cb = app.clone();
+        let ts_cb = ts.clone();
+        let root_cb = root.clone();
+        let task_id_cb = task_id.to_string();
+        let span = recognition_peak.saturating_sub(p_tr_start);
+        let progress_cb = boxed_progress(move |whisper_pct: u8| {
+            let mapped = p_tr_start
+                .saturating_add(((whisper_pct as u32 * span as u32) / 100u32) as u8)
+                .min(recognition_peak);
+            push_progress(&app_cb, &ts_cb, &root_cb, &task_id_cb, mapped, "transcribe");
+        });
+
+        let recognition_prompt = build_recognition_prompt(&job.recognition_glossary);
+        if let Err(e) = run_whisper_srt_json(
+            &whisper_cli,
+            &model_path,
+            &cache.audio_path(),
+            &rec_lang,
+            threads,
+            force_cpu,
+            &cache.w_prefix(),
+            whisper_vad.as_ref(),
+            recognition_prompt.as_deref(),
+            Some(progress_cb),
+        ) {
+            fail_task(app, ts, root, task_id, &e);
+            return;
+        }
+
+        if !cache.w_srt_path().exists() {
+            fail_task(
+                app,
+                ts,
+                root,
+                task_id,
+                "Whisper 未生成 SRT 文件（请确认 whisper.cpp 版本支持 -osrt）",
+            );
+            return;
+        }
+
+        if let Err(e) = cache.mark_whisper_done(&whisper_hash) {
+            fail_task(app, ts, root, task_id, &e);
+            return;
+        }
+        push_progress(app, ts, root, task_id, recognition_peak, "transcribe");
     }
 
-    let (srt_tmp, json_tmp) = expected_whisper_sidecar_paths(&w_prefix);
-    if !srt_tmp.exists() {
-        fail_task(
-            app,
-            ts,
-            root,
-            task_id,
-            "Whisper 未生成 SRT 文件（请确认 whisper.cpp 版本支持 -osrt）",
-        );
-        let _ = fs::remove_dir_all(&tmp_root);
-        return;
-    }
-
+    let json_path = cache.w_json_path();
     let lang_for_name =
         if rec_lang.trim().is_empty() || rec_lang.trim().eq_ignore_ascii_case("auto") {
-            read_language_from_whisper_json(&json_tmp, "und")
+            read_language_from_whisper_json(&json_path, "und")
         } else {
             rec_lang.trim().to_string()
         };
 
-    let srt_raw = match fs::read_to_string(&srt_tmp) {
-        Ok(s) => s,
-        Err(e) => {
-            fail_task(app, ts, root, task_id, &format!("读取临时 SRT 失败: {e}"));
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    };
-    let mut cues = match parse_srt(&srt_raw) {
-        Ok(c) => c,
-        Err(e) => {
-            fail_task(app, ts, root, task_id, &e);
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    };
+    check_pause_cancel!();
 
+    // ---------- 阶段 3：分句 + 优化（cues 缓存） ----------
     let llm_api_key_storage = if job.translator_engine == "llm"
         || (matches!(job.segmentation_strategy.as_str(), "auto" | "llm_preferred")
             && !job.llm_base_url.trim().is_empty()
@@ -976,98 +963,134 @@ fn run_one_task(
             Ok(s) => s.llm_api_key.trim().to_string(),
             Err(e) => {
                 fail_task(app, ts, root, task_id, &e.to_string());
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         }
     } else {
         String::new()
     };
-    if job.segmentation_strategy != "disabled" {
-        {
-            let mut g = lock_task_store(ts, "set_segmenting_state");
-            if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
-                t.normalize_state();
-                t.status = STATUS_RUNNING.into();
-                t.original_stage = ORIGINAL_STAGE_SEGMENTING.into();
-                t.progress = if job.will_translate { 45 } else { 70 };
-                t.phase = "segment_subtitles".into();
-                t.updated_at_ms = now_ms();
-                let _ = task_store::save_task_store_file(&root.0, &g);
-            }
-        }
-        emit_progress(
-            app,
-            task_id,
-            STATUS_RUNNING,
-            if job.will_translate { 45 } else { 70 },
-            "segment_subtitles",
-        );
 
-        let seg_client = match reqwest::blocking::Client::builder().build() {
+    let segment_hash = hash_parts(&[
+        &whisper_hash,
+        job.segmentation_strategy.as_str(),
+        job.segmentation_timing_mode.as_str(),
+        &job.segmentation_max_chars.to_string(),
+        &job.segmentation_max_duration_ms.to_string(),
+        if job.segmentation_strategy != "disabled" {
+            job.llm_model.as_str()
+        } else {
+            ""
+        },
+    ]);
+
+    let cues: Vec<SubCue> = if cache.segment_valid(&segment_hash) {
+        match cache.load_cues() {
             Ok(c) => c,
             Err(e) => {
-                fail_task(
-                    app,
-                    ts,
-                    root,
-                    task_id,
-                    &format!("HTTP 客户端初始化失败: {e}"),
-                );
-                let _ = fs::remove_dir_all(&tmp_root);
+                fail_task(app, ts, root, task_id, &e);
+                return;
+            }
+        }
+    } else {
+        let srt_raw = match fs::read_to_string(cache.w_srt_path()) {
+            Ok(s) => s,
+            Err(e) => {
+                fail_task(app, ts, root, task_id, &format!("读取临时 SRT 失败: {e}"));
                 return;
             }
         };
-        let seg_job = SegmentationJob {
-            strategy: job.segmentation_strategy.as_str(),
-            timing_mode: job.segmentation_timing_mode.as_str(),
-            max_chars_per_segment: job.segmentation_max_chars,
-            max_duration_ms: job.segmentation_max_duration_ms,
-            llm_base_url: job.llm_base_url.as_str(),
-            llm_model: job.llm_model.as_str(),
-            llm_api_key: llm_api_key_storage.as_str(),
-            llm_timeout_sec: job.llm_timeout_sec,
-        };
-        match segment_cues(&seg_client, &seg_job, &cues, Some(&json_tmp)) {
-            Ok(res) => {
-                cues = res.cues;
-                cache_segmentation_note(ts, root, task_id, res.note);
-            }
+        let parsed = match parse_srt(&srt_raw) {
+            Ok(c) => c,
             Err(e) => {
                 fail_task(app, ts, root, task_id, &e);
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
+        };
+
+        let mut working = parsed;
+        if job.segmentation_strategy != "disabled" {
+            {
+                let mut g = lock_task_store(ts, "set_segmenting_state");
+                if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
+                    t.normalize_state();
+                    t.status = STATUS_RUNNING.into();
+                    t.original_stage = ORIGINAL_STAGE_SEGMENTING.into();
+                    t.progress = if job.will_translate { 45 } else { 70 };
+                    t.phase = "segment_subtitles".into();
+                    t.updated_at_ms = now_ms();
+                    let _ = task_store::save_task_store_file(&root.0, &g);
+                }
+            }
+            emit_progress(
+                app,
+                task_id,
+                STATUS_RUNNING,
+                if job.will_translate { 45 } else { 70 },
+                "segment_subtitles",
+            );
+
+            let seg_client = match reqwest::blocking::Client::builder()
+                .use_rustls_tls()
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    fail_task(
+                        app,
+                        ts,
+                        root,
+                        task_id,
+                        &format!("HTTP 客户端初始化失败: {e}"),
+                    );
+                    return;
+                }
+            };
+            let seg_job = SegmentationJob {
+                strategy: job.segmentation_strategy.as_str(),
+                timing_mode: job.segmentation_timing_mode.as_str(),
+                max_chars_per_segment: job.segmentation_max_chars,
+                max_duration_ms: job.segmentation_max_duration_ms,
+                llm_base_url: job.llm_base_url.as_str(),
+                llm_model: job.llm_model.as_str(),
+                llm_api_key: llm_api_key_storage.as_str(),
+                llm_timeout_sec: job.llm_timeout_sec,
+            };
+            match segment_cues(&seg_client, &seg_job, &working, Some(&json_path)) {
+                Ok(res) => {
+                    working = res.cues;
+                    cache_segmentation_note(ts, root, task_id, res.note);
+                }
+                Err(e) => {
+                    fail_task(app, ts, root, task_id, &e);
+                    return;
+                }
+            }
+
+            check_pause_cancel!();
         }
 
-        match mid_run_poll(ts, task_id) {
-            MidRun::Continue => {}
-            MidRun::Pause => {
-                let _ = fs::remove_dir_all(&tmp_root);
-                apply_paused(ts, root, task_id, app);
-                return;
-            }
-            MidRun::Cancel => {
-                let _ = fs::remove_dir_all(&tmp_root);
-                remove_task_if_present(app, ts, root, task_id);
-                return;
-            }
-        }
-    }
+        working = optimize_source_cues(&working);
+        apply_recognition_glossary(
+            &mut working,
+            &job.recognition_glossary,
+            job.recognition_glossary_case_sensitive,
+        );
 
-    cues = optimize_source_cues(&cues);
+        if let Err(e) = cache.write_cues(&working) {
+            fail_task(app, ts, root, task_id, &e);
+            return;
+        }
+        if let Err(e) = cache.mark_segment_done(&segment_hash) {
+            fail_task(app, ts, root, task_id, &e);
+            return;
+        }
+        working
+    };
 
     let p_tr_done = if job.will_translate { 60u8 } else { 90u8 };
-    {
-        let mut g = lock_task_store(ts, "set_post_transcribe_progress");
-        if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
-            t.progress = p_tr_done;
-            t.updated_at_ms = now_ms();
-            let _ = task_store::save_task_store_file(&root.0, &g);
-        }
-    }
-    emit_progress(app, task_id, STATUS_RUNNING, p_tr_done, "transcribe");
+    push_progress(app, ts, root, task_id, p_tr_done, "transcribe");
 
+    // ---------- 阶段 4a：仅原文字幕 — 直接导出 ----------
     if !job.will_translate {
         let final_path = match resolve_original_srt_path(
             video,
@@ -1079,7 +1102,6 @@ fn run_one_task(
             Ok(p) => p,
             Err(e) => {
                 fail_task(app, ts, root, task_id, &e);
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         };
@@ -1091,7 +1113,6 @@ fn run_one_task(
                 task_id,
                 &format!("目标字幕已存在且配置为不覆盖: {}", final_path.display()),
             );
-            let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
         {
@@ -1110,7 +1131,6 @@ fn run_one_task(
         if let Some(parent) = final_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 fail_task(app, ts, root, task_id, &format!("创建输出目录失败: {e}"));
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         }
@@ -1123,7 +1143,6 @@ fn run_one_task(
                 task_id,
                 &format!("写入字幕失败: {e}（{}）", final_path.display()),
             );
-            let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
         let original_preview = preview_text(
@@ -1153,11 +1172,12 @@ fn run_one_task(
             Some(100),
             Some(""),
         );
-        let _ = fs::remove_dir_all(&tmp_root);
+        cache.cleanup();
         succeed_task(app, ts, root, task_id, None);
         return;
     }
 
+    // ---------- 阶段 4b：翻译 + 导出 ----------
     match job.translator_engine.as_str() {
         "google_web" | "llm" => {}
         _ => {
@@ -1168,7 +1188,6 @@ fn run_one_task(
                 task_id,
                 &format!("不支持的翻译引擎: {}", job.translator_engine),
             );
-            let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
     }
@@ -1181,7 +1200,6 @@ fn run_one_task(
             task_id,
             "内部错误：仅原文字幕任务不应进入翻译",
         );
-        let _ = fs::remove_dir_all(&tmp_root);
         return;
     }
 
@@ -1198,7 +1216,6 @@ fn run_one_task(
     let tgt_file_lang = job.translate_target_lang.trim().to_string();
     if tgt_file_lang.is_empty() {
         fail_task(app, ts, root, task_id, "翻译目标语言为空，请在配置中设置");
-        let _ = fs::remove_dir_all(&tmp_root);
         return;
     }
 
@@ -1215,7 +1232,6 @@ fn run_one_task(
                     Ok(p) => p,
                     Err(e) => {
                         fail_task(app, ts, root, task_id, &e);
-                        let _ = fs::remove_dir_all(&tmp_root);
                         return;
                     }
                 };
@@ -1229,7 +1245,6 @@ fn run_one_task(
                     Ok(p) => p,
                     Err(e) => {
                         fail_task(app, ts, root, task_id, &e);
-                        let _ = fs::remove_dir_all(&tmp_root);
                         return;
                     }
                 };
@@ -1245,7 +1260,6 @@ fn run_one_task(
                     Ok(p) => p,
                     Err(e) => {
                         fail_task(app, ts, root, task_id, &e);
-                        let _ = fs::remove_dir_all(&tmp_root);
                         return;
                     }
                 };
@@ -1259,7 +1273,6 @@ fn run_one_task(
                     task_id,
                     &format!("未知字幕模式: {}", job.subtitle_mode),
                 );
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         };
@@ -1274,7 +1287,6 @@ fn run_one_task(
                     task_id,
                     &format!("目标字幕已存在且配置为不覆盖: {}", p.display()),
                 );
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         }
@@ -1287,7 +1299,6 @@ fn run_one_task(
                     task_id,
                     &format!("目标字幕已存在且配置为不覆盖: {}", p.display()),
                 );
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         }
@@ -1300,7 +1311,6 @@ fn run_one_task(
                     task_id,
                     &format!("目标字幕已存在且配置为不覆盖: {}", p.display()),
                 );
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         }
@@ -1315,7 +1325,6 @@ fn run_one_task(
                 task_id,
                 "Internal error: missing original subtitle output path for dual_files mode",
             );
-            let _ = fs::remove_dir_all(&tmp_root);
             return;
         };
         update_task_runtime_state(
@@ -1331,30 +1340,16 @@ fn run_one_task(
         if let Some(parent) = po.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 fail_task(app, ts, root, task_id, &format!("创建输出目录失败: {e}"));
-                let _ = fs::remove_dir_all(&tmp_root);
                 return;
             }
         }
         if let Err(e) = fs::write(po, format_srt(&cues)) {
             fail_task(app, ts, root, task_id, &format!("写入原文字幕失败: {e}"));
-            let _ = fs::remove_dir_all(&tmp_root);
             return;
         }
     }
 
-    match mid_run_poll(ts, task_id) {
-        MidRun::Continue => {}
-        MidRun::Pause => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            apply_paused(ts, root, task_id, app);
-            return;
-        }
-        MidRun::Cancel => {
-            let _ = fs::remove_dir_all(&tmp_root);
-            remove_task_if_present(app, ts, root, task_id);
-            return;
-        }
-    }
+    check_pause_cancel!();
 
     update_task_runtime_state(
         ts,
@@ -1375,10 +1370,38 @@ fn run_one_task(
             task_id,
             "未配置 LLM API Key：请在配置页保存密钥",
         );
-        let _ = fs::remove_dir_all(&tmp_root);
         return;
     }
 
+    // 计算 translate stamp 并加载已有 partial
+    let translate_hash = hash_parts(&[
+        &segment_hash,
+        job.translator_engine.as_str(),
+        job.translate_source_lang.trim(),
+        job.translate_target_lang.trim(),
+        if job.translator_engine == "llm" {
+            job.llm_model.as_str()
+        } else {
+            ""
+        },
+        job.translate_style.as_str(),
+    ]);
+    if let Err(e) = cache.begin_translate(&translate_hash) {
+        fail_task(app, ts, root, task_id, &e);
+        return;
+    }
+    let mut partial = cache.load_partial_translations();
+
+    let mut remaining_cues: Vec<SubCue> = Vec::with_capacity(cues.len());
+    let mut remaining_to_orig: Vec<usize> = Vec::with_capacity(cues.len());
+    for (orig_idx, cue) in cues.iter().enumerate() {
+        if !partial.contains_key(&orig_idx) {
+            remaining_cues.push(cue.clone());
+            remaining_to_orig.push(orig_idx);
+        }
+    }
+
+    let initial_progress = compute_translate_progress(partial.len(), cues.len());
     {
         let mut g = lock_task_store(ts, "set_translating_state");
         if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
@@ -1386,7 +1409,7 @@ fn run_one_task(
             t.status = STATUS_RUNNING.into();
             t.original_stage = ORIGINAL_STAGE_COMPLETED.into();
             t.translation_stage = TRANSLATION_STAGE_TRANSLATING.into();
-            t.progress = 62;
+            t.progress = initial_progress;
             t.phase = if job.translator_engine == "google_web" {
                 "translate_google".into()
             } else {
@@ -1400,7 +1423,7 @@ fn run_one_task(
         app,
         task_id,
         STATUS_RUNNING,
-        62,
+        initial_progress,
         if job.translator_engine == "google_web" {
             "translate_google"
         } else {
@@ -1408,110 +1431,141 @@ fn run_one_task(
         },
     );
 
-    let client = match reqwest::blocking::Client::builder().build() {
-        Ok(c) => c,
-        Err(e) => {
-            fail_task(
-                app,
-                ts,
-                root,
-                task_id,
-                &format!("HTTP 客户端初始化失败: {e}"),
-            );
-            let _ = fs::remove_dir_all(&tmp_root);
-            return;
-        }
-    };
-
-    let ts_p = ts.clone();
-    let tid_p = task_id.to_string();
-    let ts_prog = ts.clone();
-    let tid_prog = task_id.to_string();
-    let app_prog = app.clone();
-    let root_prog = root.0.clone();
-
-    let translate_res = if job.translator_engine == "llm" {
-        let tjob = TranslateJob {
-            base_url: &job.llm_base_url,
-            model: &job.llm_model,
-            api_key: &llm_api_key_storage,
-            timeout_sec: job.llm_timeout_sec.max(5),
-            max_retries_per_batch: job.llm_max_retries,
-            min_interval_ms: job.translator_min_interval_ms,
-            source_lang: job.translate_source_lang.as_str(),
-            target_lang: job.translate_target_lang.as_str(),
-            style: job.translate_style.as_str(),
-            keep_proper_nouns: job.keep_proper_nouns,
-            glossary: &job.glossary,
-            glossary_case_sensitive: job.glossary_case_sensitive,
-        };
-        translate_all_cues(
-            &client,
-            &tjob,
-            &cues,
-            job.translate_max_segment_chars,
-            move || translation_should_abort(&ts_p, &tid_p),
-            move |done, total| {
-                let p = if total == 0 {
-                    62u8
-                } else {
-                    (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
-                };
-                let mut g = lock_task_store(&ts_prog, "translate_llm_progress");
-                if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
-                    tt.progress = p;
-                    tt.updated_at_ms = now_ms();
-                    let _ = task_store::save_task_store_file(&root_prog, &g);
-                }
-                emit_progress(&app_prog, &tid_prog, STATUS_RUNNING, p, "translate_llm");
-            },
-            Some(llm_slots),
-            job.translate_concurrency,
-        )
+    let translate_res: Result<(Vec<String>, bool), String> = if remaining_cues.is_empty() {
+        Ok((Vec::new(), false))
     } else {
-        let google_client = match build_google_client(
-            job.translator_use_proxy,
-            job.llm_timeout_sec.max(5),
-        ) {
+        let client = match reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
-                fail_task(app, ts, root, task_id, &e);
-                let _ = fs::remove_dir_all(&tmp_root);
+                let _ = cache.save_partial_translations(&partial);
+                fail_task(
+                    app,
+                    ts,
+                    root,
+                    task_id,
+                    &format!("HTTP 客户端初始化失败: {e}"),
+                );
                 return;
             }
         };
-        let gjob = GoogleWebTranslateJob {
-            provider_url: job.translator_provider_url.as_str(),
-            use_proxy: job.translator_use_proxy,
-            min_interval_ms: job.translator_min_interval_ms,
-            source_lang: job.translate_source_lang.as_str(),
-            target_lang: job.translate_target_lang.as_str(),
+
+        let total_overall = cues.len();
+        let already_done = partial.len();
+        let phase_label = if job.translator_engine == "google_web" {
+            "translate_google"
+        } else {
+            "translate_llm"
+        }
+        .to_string();
+
+        let app_prog = app.clone();
+        let ts_prog = ts.clone();
+        let root_prog = root.clone();
+        let tid_prog = task_id.to_string();
+        let phase_prog = phase_label.clone();
+        let mut on_progress = move |done_remaining: usize, _total_remaining: usize| {
+            let total_done = already_done + done_remaining;
+            let p = compute_translate_progress(total_done, total_overall);
+            push_progress(&app_prog, &ts_prog, &root_prog, &tid_prog, p, &phase_prog);
         };
-        translate_all_cues_google(
-            &google_client,
-            &gjob,
-            &cues,
-            move || translation_should_abort(&ts_p, &tid_p),
-            move |done, total| {
-                let p = if total == 0 {
-                    62u8
-                } else {
-                    (62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26)) as u8
-                };
-                let mut g = lock_task_store(&ts_prog, "translate_google_progress");
-                if let Some(tt) = g.tasks.iter_mut().find(|x| x.id == tid_prog) {
-                    tt.progress = p;
-                    tt.updated_at_ms = now_ms();
-                    let _ = task_store::save_task_store_file(&root_prog, &g);
+
+        let cache_dir_clone = cache.dir().to_path_buf();
+        let partial_ref: Arc<Mutex<HashMap<usize, String>>> =
+            Arc::new(Mutex::new(std::mem::take(&mut partial)));
+        let map_to_orig = remaining_to_orig.clone();
+        let partial_for_cb = partial_ref.clone();
+        let mut on_item_done = move |rel_idx: usize, text: &str| {
+            let Some(&orig_idx) = map_to_orig.get(rel_idx) else {
+                return;
+            };
+            let snapshot: HashMap<String, String> = {
+                let mut g = partial_for_cb.lock().unwrap_or_else(|e| e.into_inner());
+                g.insert(orig_idx, text.to_string());
+                g.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+            };
+            if let Ok(body) = serde_json::to_string(&snapshot) {
+                let _ = fs::write(cache_dir_clone.join("translations.partial.json"), body);
+            }
+        };
+
+        let ts_p = ts.clone();
+        let tid_p = task_id.to_string();
+        let result = if job.translator_engine == "llm" {
+            let tjob = TranslateJob {
+                base_url: &job.llm_base_url,
+                model: &job.llm_model,
+                api_key: &llm_api_key_storage,
+                timeout_sec: job.llm_timeout_sec.max(5),
+                max_retries_per_batch: job.llm_max_retries,
+                min_interval_ms: job.translator_min_interval_ms,
+                source_lang: job.translate_source_lang.as_str(),
+                target_lang: job.translate_target_lang.as_str(),
+                style: job.translate_style.as_str(),
+                keep_proper_nouns: job.keep_proper_nouns,
+                glossary: &job.glossary,
+                glossary_case_sensitive: job.glossary_case_sensitive,
+            };
+            translate_all_cues(
+                &client,
+                &tjob,
+                &remaining_cues,
+                job.translate_max_segment_chars,
+                move || translation_should_abort(&ts_p, &tid_p),
+                &mut on_progress,
+                &mut on_item_done,
+                Some(llm_slots),
+                job.translate_concurrency,
+            )
+        } else {
+            let google_client = match build_google_client(
+                job.translator_use_proxy,
+                job.llm_timeout_sec.max(5),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    partial = match partial_ref.lock() {
+                        Ok(g) => g.clone(),
+                        Err(p) => p.into_inner().clone(),
+                    };
+                    let _ = cache.save_partial_translations(&partial);
+                    fail_task(app, ts, root, task_id, &e);
+                    return;
                 }
-                emit_progress(&app_prog, &tid_prog, STATUS_RUNNING, p, "translate_google");
-            },
-        )
-        .map(|translated| (translated, false))
+            };
+            let gjob = GoogleWebTranslateJob {
+                provider_url: job.translator_provider_url.as_str(),
+                use_proxy: job.translator_use_proxy,
+                min_interval_ms: job.translator_min_interval_ms,
+                source_lang: job.translate_source_lang.as_str(),
+                target_lang: job.translate_target_lang.as_str(),
+            };
+            translate_all_cues_google(
+                &google_client,
+                &gjob,
+                &remaining_cues,
+                move || translation_should_abort(&ts_p, &tid_p),
+                &mut on_progress,
+                &mut on_item_done,
+            )
+            .map(|t| (t, false))
+        };
+
+        partial = match partial_ref.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        result
     };
 
     match translate_res {
-        Ok((translated, any_fb)) => {
+        Ok((_remaining_translations, any_fb)) => {
+            let translated: Vec<String> = (0..cues.len())
+                .map(|i| partial.get(&i).cloned().unwrap_or_default())
+                .collect();
+
             {
                 let mut g = lock_task_store(ts, "set_translation_export_state");
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task_id) {
@@ -1560,10 +1614,9 @@ fn run_one_task(
                 Ok(())
             })();
 
-            let _ = fs::remove_dir_all(&tmp_root);
-
             match r_export {
                 Ok(()) => {
+                    let _ = cache.mark_translate_done(&translate_hash);
                     let original_preview = preview_text(
                         &cues
                             .iter()
@@ -1588,23 +1641,38 @@ fn run_one_task(
                     } else {
                         None
                     };
+                    cache.cleanup();
                     succeed_task(app, ts, root, task_id, note);
                 }
-                Err(e) => fail_task(app, ts, root, task_id, &e),
+                Err(e) => {
+                    let _ = cache.save_partial_translations(&partial);
+                    fail_task(app, ts, root, task_id, &e);
+                }
             }
         }
         Err(e) if e == "__pause__" => {
-            let _ = fs::remove_dir_all(&tmp_root);
+            let _ = cache.save_partial_translations(&partial);
             match mid_run_poll(ts, task_id) {
                 MidRun::Pause => apply_paused(ts, root, task_id, app),
-                _ => remove_task_if_present(app, ts, root, task_id),
+                _ => {
+                    cache.cleanup();
+                    remove_task_if_present(app, ts, root, task_id);
+                }
             }
         }
         Err(e) => {
+            let _ = cache.save_partial_translations(&partial);
             fail_task(app, ts, root, task_id, &e);
-            let _ = fs::remove_dir_all(&tmp_root);
         }
     }
+}
+
+fn compute_translate_progress(done: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 62;
+    }
+    let p = 62u32 + ((done as u32).saturating_mul(26) / total as u32).min(26);
+    p.min(88) as u8
 }
 
 #[cfg(test)]

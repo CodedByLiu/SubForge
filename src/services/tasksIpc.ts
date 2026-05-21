@@ -40,6 +40,10 @@ export async function pauseTask(id: string): Promise<void> {
   return invoke("pause_task", { id });
 }
 
+export async function retryTaskTranslation(id: string): Promise<void> {
+  return invoke("retry_task_translation", { id });
+}
+
 export async function pauseAllTasks(): Promise<void> {
   return invoke("pause_all_tasks");
 }

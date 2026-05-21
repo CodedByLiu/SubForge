@@ -11,6 +11,7 @@ import {
   openOutputDir,
   pauseAllTasks,
   pauseTask,
+  retryTaskTranslation,
   setPanelOutput,
   startTask,
   startTasks,
@@ -413,6 +414,20 @@ export function MainPage() {
                     >
                       {taskActionLabel(task)}
                     </button>
+                    {task.can_retry_translation ? (
+                      <button
+                        type="button"
+                        disabled={busy || pipelineActiveStatus(task.status)}
+                        onClick={() => void run(() => retryTaskTranslation(task.id))}
+                        title={
+                          task.translate_fallback_count > 0
+                            ? `仅重新翻译 ${task.translate_fallback_count} 条失败片段`
+                            : "重新翻译失败片段"
+                        }
+                      >
+                        重新翻译
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       disabled={busy || !canPause(task)}

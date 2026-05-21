@@ -1,7 +1,7 @@
 //! LLM batch translation with JSON alignment validation, retries, splitting,
 //! and per-item fallback to source text.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -341,9 +341,9 @@ fn translate_indices_recursive(
     sleep_next: &mut bool,
     llm_slots: Option<&LlmRequestSlots>,
     llm_cap: u32,
-) -> (Vec<String>, bool) {
+) -> (Vec<String>, Vec<usize>) {
     if indices.is_empty() {
-        return (Vec::new(), false);
+        return (Vec::new(), Vec::new());
     }
 
     if indices.len() == 1 {
@@ -362,7 +362,7 @@ fn translate_indices_recursive(
             ) {
                 Ok(BatchParse::Complete(v)) if v.len() == 1 => {
                     *sleep_next = true;
-                    return (v, false);
+                    return (v, Vec::new());
                 }
                 Ok(BatchParse::Partial { .. }) => {}
                 Err(e) => {
@@ -372,7 +372,7 @@ fn translate_indices_recursive(
             }
             *sleep_next = true;
         }
-        return (vec![orig], true);
+        return (vec![orig], vec![i]);
     }
 
     let mut best_partial: Option<PartialBatchAttempt> = None;
@@ -389,7 +389,7 @@ fn translate_indices_recursive(
         ) {
             Ok(BatchParse::Complete(v)) if v.len() == indices.len() => {
                 *sleep_next = true;
-                return (v, false);
+                return (v, Vec::new());
             }
             Ok(BatchParse::Partial { found, missing }) => {
                 log::warn!(
@@ -435,7 +435,7 @@ fn translate_indices_recursive(
             .map(|(_, text)| text.clone());
         let mut found_map: HashMap<usize, String> = best.found.into_iter().collect();
         let hint_text = hint_text_owned.as_deref().or(context_hint);
-        let (repaired, fb) = translate_indices_recursive(
+        let (repaired, mut fb) = translate_indices_recursive(
             client,
             job,
             cues,
@@ -454,13 +454,16 @@ fn translate_indices_recursive(
                 merged.push(text);
             } else {
                 merged.push(cues[*idx].text.clone());
+                if !fb.contains(idx) {
+                    fb.push(*idx);
+                }
             }
         }
         return (merged, fb);
     }
 
     let mid = indices.len() / 2;
-    let (left, fb1) = translate_indices_recursive(
+    let (left, mut fb1) = translate_indices_recursive(
         client,
         job,
         cues,
@@ -483,11 +486,13 @@ fn translate_indices_recursive(
     );
     let mut out = left;
     out.extend(right);
-    (out, fb1 || fb2)
+    fb1.extend(fb2);
+    (out, fb1)
 }
 
 /// Returns translations with the same length as `cues`.
-/// `any_fallback` is true if some items finally fell back to source text.
+/// The second element of the tuple is the list of cue indices (relative to `cues`)
+/// that ultimately fell back to source text after exhausting retries.
 /// If `pause_requested` returns true between batches, returns `Err("__pause__")`.
 pub fn translate_all_cues(
     client: &Client,
@@ -499,9 +504,9 @@ pub fn translate_all_cues(
     mut on_item_done: impl FnMut(usize, &str),
     llm_slots: Option<&LlmRequestSlots>,
     llm_concurrency_cap: u32,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, Vec<usize>), String> {
     if cues.is_empty() {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), Vec::new()));
     }
     if job.base_url.trim().is_empty() {
         return Err("LLM Base URL is empty".into());
@@ -515,7 +520,7 @@ pub fn translate_all_cues(
 
     let batches = build_batches(cues, max_segment_chars);
     let mut out = vec![String::new(); cues.len()];
-    let mut any_fb = false;
+    let mut fallback_indices: Vec<usize> = Vec::new();
     let mut done = 0usize;
     let mut sleep_next = false;
     let mut last_tail: Option<String> = None;
@@ -525,7 +530,7 @@ pub fn translate_all_cues(
             return Err("__pause__".into());
         }
         let ctx = last_tail.as_deref();
-        let (parts, fb) = translate_indices_recursive(
+        let (parts, mut fb) = translate_indices_recursive(
             client,
             job,
             cues,
@@ -535,17 +540,20 @@ pub fn translate_all_cues(
             llm_slots,
             llm_concurrency_cap,
         );
-        any_fb |= fb;
+        let fb_set: HashSet<usize> = fb.iter().copied().collect();
         for (&i, t) in batch.iter().zip(parts.iter()) {
             out[i] = t.clone();
-            on_item_done(i, t);
+            if !fb_set.contains(&i) {
+                on_item_done(i, t);
+            }
         }
+        fallback_indices.append(&mut fb);
         done += batch.len();
         last_tail = batch.last().map(|&i| out[i].clone());
         on_progress(done, cues.len());
     }
 
-    Ok((out, any_fb))
+    Ok((out, fallback_indices))
 }
 
 #[cfg(test)]

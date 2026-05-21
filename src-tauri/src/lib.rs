@@ -94,6 +94,7 @@ pub fn run() {
             task_commands::start_task,
             task_commands::start_tasks,
             task_commands::pause_task,
+            task_commands::retry_task_translation,
             task_commands::pause_all_tasks,
             task_commands::continue_all_tasks,
             task_commands::open_output_dir,

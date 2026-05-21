@@ -8,10 +8,12 @@ use uuid::Uuid;
 
 use crate::domain::config::AppConfig;
 use crate::domain::task::{
-    TaskRecord, TaskStoreFile, ORIGINAL_STAGE_WAITING, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_PAUSE_REQUESTED, STATUS_PENDING, STATUS_QUEUED, STATUS_RUNNING,
-    TRANSLATION_STAGE_NOT_REQUIRED, TRANSLATION_STAGE_WAITING_ORIGINAL,
+    TaskRecord, TaskStoreFile, ORIGINAL_STAGE_COMPLETED, ORIGINAL_STAGE_WAITING, STATUS_COMPLETED,
+    STATUS_FAILED, STATUS_PAUSED, STATUS_PAUSE_REQUESTED, STATUS_PENDING, STATUS_QUEUED,
+    STATUS_RUNNING, TRANSLATION_STAGE_FAILED, TRANSLATION_STAGE_NOT_REQUIRED,
+    TRANSLATION_STAGE_QUEUED, TRANSLATION_STAGE_WAITING_ORIGINAL,
 };
+use crate::infra::cache::TaskCache;
 use crate::infra::config_store;
 use crate::infra::secrets;
 use crate::infra::task_store::{self, normalize_existing_path, video_extension_ok};
@@ -123,6 +125,75 @@ fn resume_with_existing_snapshot(task: &mut TaskRecord, tnow: i64) {
     task.updated_at_ms = tnow;
 }
 
+/// 已经导出过原字幕文件的 LLM 任务，可以跳过 audio/whisper/segment 直接走翻译。
+/// 沿用 retry_translation_only 标记触发 runner 端的快速路径，保留 original_output_path
+/// 让 runner 在 cache 失效时也能从 SRT 解析回 cues。
+fn resume_translate_only(task: &mut TaskRecord, tnow: i64, original_srt: String) {
+    task.original_output_path = Some(original_srt);
+    task.translate_note = None;
+    task.segmentation_note = None;
+    task.error_message = None;
+    task.cancel_requested = false;
+    task.translated_preview = None;
+    task.translated_output_path = None;
+    task.bilingual_output_path = None;
+    task.status = STATUS_QUEUED.into();
+    task.original_stage = ORIGINAL_STAGE_COMPLETED.into();
+    task.translation_stage = TRANSLATION_STAGE_QUEUED.into();
+    task.retry_translation_only = true;
+    task.progress = 0;
+    task.phase.clear();
+    task.updated_at_ms = tnow;
+}
+
+/// 探测任务关联的原字幕 SRT 文件路径：
+/// 1) 先用 task.original_output_path（若文件还在）
+/// 2) 否则在 video_dir 模式下扫描视频同目录，寻找 `{stem}_{lang}.srt`（排除已知译文）
+fn detect_original_srt(task: &TaskRecord) -> Option<String> {
+    if let Some(p) = task.original_output_path.as_deref() {
+        if Path::new(p).is_file() {
+            return Some(p.to_string());
+        }
+    }
+    // custom 输出目录命名带 hash，命名空间复杂，先不在这里尝试探测
+    if task.snapshot_output_dir_mode == "custom" {
+        return None;
+    }
+    let video = Path::new(&task.video_path);
+    let stem = video.file_stem()?.to_str()?.to_string();
+    let dir = video.parent()?;
+    let tgt_lang = task
+        .translate_target_lang_snapshot
+        .trim()
+        .to_ascii_lowercase();
+    let entries = std::fs::read_dir(dir).ok()?;
+    let prefix = format!("{stem}_");
+    let mut best: Option<PathBuf> = None;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().ends_with(".srt") {
+            continue;
+        }
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let middle = &name[prefix.len()..name.len() - 4];
+        if !tgt_lang.is_empty() && middle.eq_ignore_ascii_case(&tgt_lang) {
+            continue;
+        }
+        best = Some(path);
+        break;
+    }
+    best.map(|p| p.to_string_lossy().to_string())
+}
+
+
 fn cancel_pause_request(task: &mut TaskRecord, tnow: i64) {
     task.status = STATUS_RUNNING.into();
     task.updated_at_ms = tnow;
@@ -224,6 +295,8 @@ pub struct TaskRowDto {
     pub original_preview: Option<String>,
     pub translated_preview: Option<String>,
     pub error_message: Option<String>,
+    pub translate_fallback_count: u32,
+    pub can_retry_translation: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,26 +356,42 @@ pub fn list_tasks(
     let tasks = store
         .tasks
         .iter()
-        .map(|t| TaskRowDto {
-            id: t.id.clone(),
-            video_path: t.video_path.clone(),
-            file_name: t.file_name.clone(),
-            file_size: t.file_size,
-            duration_sec: t.duration_sec,
-            status: t.status.clone(),
-            original_stage: t.original_stage.clone(),
-            translation_stage: t.translation_stage.clone(),
-            progress: t.progress,
-            phase: t.phase.clone(),
-            will_translate: t.will_translate,
-            retry_attempts: t.retry_attempts,
-            cancel_requested: t.cancel_requested,
-            snapshot_summary: t.snapshot_summary.clone(),
-            original_status_display: t.original_status_label(),
-            translate_status_display: t.translate_status_label(),
-            original_preview: t.original_preview.clone(),
-            translated_preview: t.translated_preview.clone(),
-            error_message: t.error_message.clone(),
+        .map(|t| {
+            let is_llm = t.translator_engine_snapshot == "llm";
+            // 兼容旧任务：`translate_fallback_count` 字段是新加的，老的完成任务该字段为 0，
+            // 但 translate_note 里仍记着"部分片段翻译失败，已回退原文"。
+            let note_says_fallback = t
+                .translate_note
+                .as_deref()
+                .map_or(false, |n| n.contains("部分片段翻译失败"));
+            let partial_fallback = t.status == STATUS_COMPLETED
+                && (t.translate_fallback_count > 0 || note_says_fallback);
+            let full_failure =
+                t.status == STATUS_FAILED && t.translation_stage == TRANSLATION_STAGE_FAILED;
+            let can_retry_translation = is_llm && (partial_fallback || full_failure);
+            TaskRowDto {
+                id: t.id.clone(),
+                video_path: t.video_path.clone(),
+                file_name: t.file_name.clone(),
+                file_size: t.file_size,
+                duration_sec: t.duration_sec,
+                status: t.status.clone(),
+                original_stage: t.original_stage.clone(),
+                translation_stage: t.translation_stage.clone(),
+                progress: t.progress,
+                phase: t.phase.clone(),
+                will_translate: t.will_translate,
+                retry_attempts: t.retry_attempts,
+                cancel_requested: t.cancel_requested,
+                snapshot_summary: t.snapshot_summary.clone(),
+                original_status_display: t.original_status_label(),
+                translate_status_display: t.translate_status_label(),
+                original_preview: t.original_preview.clone(),
+                translated_preview: t.translated_preview.clone(),
+                error_message: t.error_message.clone(),
+                translate_fallback_count: t.translate_fallback_count,
+                can_retry_translation,
+            }
         })
         .collect();
     Ok(TaskListPanel {
@@ -436,6 +525,8 @@ pub fn import_videos(
             translated_output_path: None,
             bilingual_output_path: None,
             translate_note: None,
+            translate_fallback_count: 0,
+            retry_translation_only: false,
             cancel_requested: false,
             error_message: None,
             created_at_ms: tnow,
@@ -514,7 +605,13 @@ pub fn start_task(
             cancel_pause_request(t, tnow);
         }
         STATUS_PAUSED | STATUS_FAILED if has_snapshot(t) => {
-            resume_with_existing_snapshot(t, tnow);
+            if let Some(srt) = detect_original_srt(t).filter(|_| {
+                t.will_translate && t.translator_engine_snapshot == "llm"
+            }) {
+                resume_translate_only(t, tnow, srt);
+            } else {
+                resume_with_existing_snapshot(t, tnow);
+            }
         }
         STATUS_PAUSED | STATUS_FAILED => {
             validate_prestart_requirements(&root, &cfg)?;
@@ -547,7 +644,13 @@ pub fn start_tasks(root: State<'_, AppRoot>, ts: State<'_, TaskState>) -> Result
                     cancel_pause_request(t, tnow);
                 }
                 STATUS_PAUSED | STATUS_FAILED if has_snapshot(t) => {
-                    resume_with_existing_snapshot(t, tnow);
+                    if let Some(srt) = detect_original_srt(t).filter(|_| {
+                        t.will_translate && t.translator_engine_snapshot == "llm"
+                    }) {
+                        resume_translate_only(t, tnow, srt);
+                    } else {
+                        resume_with_existing_snapshot(t, tnow);
+                    }
                 }
                 STATUS_PAUSED | STATUS_FAILED => {
                     validate_prestart_requirements(&root, &cfg)?;
@@ -586,6 +689,109 @@ pub fn pause_task(
         }
         _ => return Err("当前状态不可暂停".into()),
     }
+    persist(&root, &store)
+}
+
+/// 重新翻译上一轮失败/回退的片段。沿用原任务的 LLM 引擎设置。
+/// 跳过 audio/whisper/segment 阶段——cues 优先用 cache 中的 `cues.json`，
+/// 否则从视频旁已导出的原字幕 SRT 文件（task.original_output_path）解析回来。
+#[tauri::command]
+pub fn retry_task_translation(
+    root: State<'_, AppRoot>,
+    ts: State<'_, TaskState>,
+    id: String,
+) -> Result<(), String> {
+    let (video_path, original_output_path) = {
+        let store = ts.0.lock().map_err(|e| e.to_string())?;
+        let t = store
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| "找不到任务".to_string())?;
+        if t.translator_engine_snapshot != "llm" {
+            return Err("仅支持 LLM 引擎任务的失败片段重新翻译".into());
+        }
+        let note_says_fallback = t
+            .translate_note
+            .as_deref()
+            .map_or(false, |n| n.contains("部分片段翻译失败"));
+        let partial_fallback = t.status == STATUS_COMPLETED
+            && (t.translate_fallback_count > 0 || note_says_fallback);
+        let full_failure =
+            t.status == STATUS_FAILED && t.translation_stage == TRANSLATION_STAGE_FAILED;
+        if !partial_fallback && !full_failure {
+            return Err("当前任务没有可重新翻译的失败片段".into());
+        }
+        (t.video_path.clone(), t.original_output_path.clone())
+    };
+
+    let video = Path::new(&video_path);
+    if !video.exists() {
+        return Err(format!("视频文件不存在: {}", video.display()));
+    }
+
+    // 至少要拿到 cues —— cache 里有就用 cache 的，否则从原字幕 SRT 文件回填到 cache.
+    let cache = TaskCache::open(&root.0, video)?;
+    let cues = match cache.load_cues() {
+        Ok(c) => c,
+        Err(_) => {
+            let srt_path = original_output_path.as_deref().ok_or_else(|| {
+                "无法重新翻译：原字幕缓存与已导出文件都已丢失，请用「重试」从头执行".to_string()
+            })?;
+            if !Path::new(srt_path).exists() {
+                return Err(format!(
+                    "无法重新翻译：原字幕文件不存在（{srt_path}），请用「重试」从头执行"
+                ));
+            }
+            let raw = std::fs::read_to_string(srt_path)
+                .map_err(|e| format!("读取原字幕文件失败: {e}"))?;
+            let parsed = crate::infra::srt::parse_srt(&raw)?;
+            cache.write_cues(&parsed)?;
+            parsed
+        }
+    };
+
+    // 计算需要重译的索引集：优先使用 fallback 文件；否则从 partial 缺失项推断；
+    // partial 也空时（旧任务缓存被 cleanup 过）退化为"全部重译"。
+    let existing_fallback = cache.load_fallback_indices();
+    let partial = cache.load_partial_translations();
+    let fallback: Vec<usize> = if !existing_fallback.is_empty() {
+        existing_fallback
+            .into_iter()
+            .filter(|i| *i < cues.len())
+            .collect()
+    } else if !partial.is_empty() {
+        (0..cues.len())
+            .filter(|i| !partial.contains_key(i))
+            .collect()
+    } else {
+        (0..cues.len()).collect()
+    };
+
+    if fallback.is_empty() {
+        return Err("找不到可重试的失败片段".into());
+    }
+    cache.save_fallback_indices(&fallback)?;
+
+    let mut store = ts.0.lock().map_err(|e| e.to_string())?;
+    let t = store
+        .tasks
+        .iter_mut()
+        .find(|t| t.id == id)
+        .ok_or_else(|| "找不到任务".to_string())?;
+    t.normalize_state();
+    t.status = STATUS_QUEUED.into();
+    t.original_stage = ORIGINAL_STAGE_COMPLETED.into();
+    t.translation_stage = TRANSLATION_STAGE_QUEUED.into();
+    t.retry_translation_only = true;
+    t.progress = 0;
+    t.phase.clear();
+    t.error_message = None;
+    t.translate_note = None;
+    t.translated_preview = None;
+    t.translate_fallback_count = 0;
+    t.cancel_requested = false;
+    t.updated_at_ms = now_ms();
     persist(&root, &store)
 }
 

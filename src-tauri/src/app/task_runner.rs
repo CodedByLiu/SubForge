@@ -530,6 +530,7 @@ fn succeed_task(
     root: &AppRoot,
     id: &str,
     note: Option<String>,
+    fallback_count: u32,
 ) {
     let mut g = lock_task_store(ts, "succeed_task");
     if !g.tasks.iter().any(|t| t.id == id) {
@@ -549,6 +550,8 @@ fn succeed_task(
         t.phase.clear();
         t.error_message = None;
         t.translate_note = note;
+        t.translate_fallback_count = fallback_count;
+        t.retry_translation_only = false;
         t.updated_at_ms = now_ms();
         let _ = task_store::save_task_store_file(&root.0, &g);
         emit_progress(app, id, STATUS_COMPLETED, 100, "");
@@ -572,6 +575,20 @@ fn cache_task_outputs(
         t.original_output_path = original_output_path.map(|p| p.to_string_lossy().to_string());
         t.translated_output_path = translated_output_path.map(|p| p.to_string_lossy().to_string());
         t.bilingual_output_path = bilingual_output_path.map(|p| p.to_string_lossy().to_string());
+        t.updated_at_ms = now_ms();
+        let _ = task_store::save_task_store_file(&root.0, &g);
+    }
+}
+
+fn cache_original_output_path(
+    ts: &Arc<Mutex<TaskStoreFile>>,
+    root: &AppRoot,
+    id: &str,
+    path: &Path,
+) {
+    let mut g = lock_task_store(ts, "cache_original_output_path");
+    if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+        t.original_output_path = Some(path.to_string_lossy().to_string());
         t.updated_at_ms = now_ms();
         let _ = task_store::save_task_store_file(&root.0, &g);
     }
@@ -729,11 +746,22 @@ fn run_one_task(
         };
     }
 
+    // 读取"仅重试翻译"标记与已导出的原字幕路径——开局快照一次，
+    // 后续在每个阶段决定是否跳过实际工作 / 是否能从外部 SRT 复用 cues。
+    let (retry_translation_only, original_output_path_snapshot) = {
+        let g = lock_task_store(ts, "read_retry_flag");
+        g.tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| (t.retry_translation_only, t.original_output_path.clone()))
+            .unwrap_or((false, None))
+    };
+
     check_pause_cancel!();
 
     // ---------- 阶段 1：抽取音频 ----------
     let audio_hash = hash_parts(&["audio_16k_mono_v1"]);
-    if cache.audio_valid(&audio_hash) {
+    if retry_translation_only || cache.audio_valid(&audio_hash) {
         push_progress(app, ts, root, task_id, 10, "extract_audio");
     } else {
         let ffmpeg = match resolve_ffmpeg(&job.ffmpeg_path) {
@@ -822,7 +850,7 @@ fn run_one_task(
 
     check_pause_cancel!();
 
-    if cache.whisper_valid(&whisper_hash) {
+    if retry_translation_only || cache.whisper_valid(&whisper_hash) {
         push_progress(app, ts, root, task_id, recognition_peak, "transcribe");
     } else {
         let model_path = match model_file_path(&root.0, model_id) {
@@ -990,6 +1018,56 @@ fn run_one_task(
                 fail_task(app, ts, root, task_id, &e);
                 return;
             }
+        }
+    } else if retry_translation_only {
+        // 重试翻译模式：先看 cache 的 cues.json（哪怕 stamp 不一致也认），
+        // 否则尝试从视频旁已导出的原字幕 SRT 文件解析回 cues。
+        if cache.cues_path().is_file() {
+            match cache.load_cues() {
+                Ok(c) => c,
+                Err(e) => {
+                    fail_task(app, ts, root, task_id, &e);
+                    return;
+                }
+            }
+        } else if let Some(srt_path) = original_output_path_snapshot
+            .as_deref()
+            .filter(|p| Path::new(p).exists())
+        {
+            let raw = match fs::read_to_string(srt_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    fail_task(
+                        app,
+                        ts,
+                        root,
+                        task_id,
+                        &format!("读取原字幕文件失败: {e}（{srt_path}）"),
+                    );
+                    return;
+                }
+            };
+            let parsed = match parse_srt(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    fail_task(app, ts, root, task_id, &e);
+                    return;
+                }
+            };
+            if let Err(e) = cache.write_cues(&parsed) {
+                fail_task(app, ts, root, task_id, &e);
+                return;
+            }
+            parsed
+        } else {
+            fail_task(
+                app,
+                ts,
+                root,
+                task_id,
+                "无法重新翻译：原字幕缓存与已导出文件都已丢失，请用「重试」从头执行",
+            );
+            return;
         }
     } else {
         let srt_raw = match fs::read_to_string(cache.w_srt_path()) {
@@ -1173,7 +1251,7 @@ fn run_one_task(
             Some(""),
         );
         cache.cleanup();
-        succeed_task(app, ts, root, task_id, None);
+        succeed_task(app, ts, root, task_id, None, 0);
         return;
     }
 
@@ -1222,17 +1300,27 @@ fn run_one_task(
     let (dual_orig, dual_tgt, bio_path): (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) =
         match job.subtitle_mode.as_str() {
             "dual_files" => {
-                let a = match resolve_original_srt_path(
-                    video,
-                    &job.video_path,
-                    &job.output_dir_mode,
-                    &job.custom_output_dir,
-                    &src_file_lang,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        fail_task(app, ts, root, task_id, &e);
-                        return;
+                // 重试翻译模式下，原字幕路径优先复用任务记录的实际文件，避免因 lang_for_name
+                // 在缺失 whisper json 时退化为 "und" 而生成多余的 .und.srt。
+                let a = if let Some(existing) = original_output_path_snapshot
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .filter(|p| retry_translation_only && p.exists())
+                {
+                    existing
+                } else {
+                    match resolve_original_srt_path(
+                        video,
+                        &job.video_path,
+                        &job.output_dir_mode,
+                        &job.custom_output_dir,
+                        &src_file_lang,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            fail_task(app, ts, root, task_id, &e);
+                            return;
+                        }
                     }
                 };
                 let b = match resolve_original_srt_path(
@@ -1277,7 +1365,8 @@ fn run_one_task(
             }
         };
 
-    if !job.subtitle_overwrite {
+    // 重试翻译模式天然就是要覆盖上一轮的输出，跳过 overwrite=false 的存在性检查。
+    if !job.subtitle_overwrite && !retry_translation_only {
         if let Some(p) = &dual_orig {
             if p.exists() {
                 fail_task(
@@ -1327,26 +1416,31 @@ fn run_one_task(
             );
             return;
         };
-        update_task_runtime_state(
-            ts,
-            root,
-            task_id,
-            Some(STATUS_RUNNING),
-            Some(ORIGINAL_STAGE_EXPORTING),
-            Some(TRANSLATION_STAGE_WAITING_ORIGINAL),
-            None,
-            Some("export_srt"),
-        );
-        if let Some(parent) = po.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                fail_task(app, ts, root, task_id, &format!("创建输出目录失败: {e}"));
+        // 重试翻译模式下原字幕文件就是 cues 的来源（或与之等价），不重写，避免改动 mtime。
+        if !(retry_translation_only && po.exists()) {
+            update_task_runtime_state(
+                ts,
+                root,
+                task_id,
+                Some(STATUS_RUNNING),
+                Some(ORIGINAL_STAGE_EXPORTING),
+                Some(TRANSLATION_STAGE_WAITING_ORIGINAL),
+                None,
+                Some("export_srt"),
+            );
+            if let Some(parent) = po.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    fail_task(app, ts, root, task_id, &format!("创建输出目录失败: {e}"));
+                    return;
+                }
+            }
+            if let Err(e) = fs::write(po, format_srt(&cues)) {
+                fail_task(app, ts, root, task_id, &format!("写入原文字幕失败: {e}"));
                 return;
             }
         }
-        if let Err(e) = fs::write(po, format_srt(&cues)) {
-            fail_task(app, ts, root, task_id, &format!("写入原文字幕失败: {e}"));
-            return;
-        }
+        // 立即持久化原字幕路径——即便后续翻译失败，下次点"继续/重试"也能识别到原字幕已就绪。
+        cache_original_output_path(ts, root, task_id, po);
     }
 
     check_pause_cancel!();
@@ -1392,6 +1486,26 @@ fn run_one_task(
     }
     let mut partial = cache.load_partial_translations();
 
+    // 若任务被标记为"仅重试翻译"模式，把上一轮回退到原文的索引从 partial 中移除，
+    // 让它们重新进入 remaining_cues 走完整翻译流程。
+    {
+        let mut g = lock_task_store(ts, "consume_retry_translation_only");
+        if let Some(t) = g.tasks.iter_mut().find(|x| x.id == task_id) {
+            if t.retry_translation_only {
+                let fb = cache.load_fallback_indices();
+                if !fb.is_empty() {
+                    for idx in &fb {
+                        partial.remove(idx);
+                    }
+                    let _ = cache.save_partial_translations(&partial);
+                }
+                t.retry_translation_only = false;
+                t.updated_at_ms = now_ms();
+                let _ = task_store::save_task_store_file(&root.0, &g);
+            }
+        }
+    }
+
     let mut remaining_cues: Vec<SubCue> = Vec::with_capacity(cues.len());
     let mut remaining_to_orig: Vec<usize> = Vec::with_capacity(cues.len());
     for (orig_idx, cue) in cues.iter().enumerate() {
@@ -1431,8 +1545,8 @@ fn run_one_task(
         },
     );
 
-    let translate_res: Result<(Vec<String>, bool), String> = if remaining_cues.is_empty() {
-        Ok((Vec::new(), false))
+    let translate_res: Result<(Vec<String>, Vec<usize>), String> = if remaining_cues.is_empty() {
+        Ok((Vec::new(), Vec::new()))
     } else {
         let client = match reqwest::blocking::Client::builder()
             .use_rustls_tls()
@@ -1550,7 +1664,7 @@ fn run_one_task(
                 &mut on_progress,
                 &mut on_item_done,
             )
-            .map(|t| (t, false))
+            .map(|t| (t, Vec::new()))
         };
 
         partial = match partial_ref.lock() {
@@ -1561,9 +1675,20 @@ fn run_one_task(
     };
 
     match translate_res {
-        Ok((_remaining_translations, any_fb)) => {
+        Ok((_remaining_translations, fallback_rel_indices)) => {
+            // 将翻译器返回的相对索引（基于 remaining_cues）映射回 cues 的绝对索引
+            let fallback_orig: Vec<usize> = fallback_rel_indices
+                .iter()
+                .filter_map(|&rel| remaining_to_orig.get(rel).copied())
+                .collect();
+            // 回退片段虽然未保存进 partial，但导出时也要走原文，所以这里把它们写入 translated
             let translated: Vec<String> = (0..cues.len())
-                .map(|i| partial.get(&i).cloned().unwrap_or_default())
+                .map(|i| {
+                    partial
+                        .get(&i)
+                        .cloned()
+                        .unwrap_or_else(|| cues[i].text.clone())
+                })
                 .collect();
 
             {
@@ -1636,13 +1761,20 @@ fn run_one_task(
                         dual_tgt.as_deref(),
                         bio_path.as_deref(),
                     );
-                    let note = if any_fb {
-                        Some("部分片段翻译失败，已回退原文".into())
+                    let (note, fb_count) = if fallback_orig.is_empty() {
+                        cache.clear_fallback_indices();
+                        cache.cleanup();
+                        (None, 0u32)
                     } else {
-                        None
+                        if let Err(e) = cache.save_fallback_indices(&fallback_orig) {
+                            log::warn!(target: "subforge_task", "save_fallback_indices failed: {e}");
+                        }
+                        (
+                            Some("部分片段翻译失败，已回退原文".into()),
+                            fallback_orig.len() as u32,
+                        )
                     };
-                    cache.cleanup();
-                    succeed_task(app, ts, root, task_id, note);
+                    succeed_task(app, ts, root, task_id, note, fb_count);
                 }
                 Err(e) => {
                     let _ = cache.save_partial_translations(&partial);

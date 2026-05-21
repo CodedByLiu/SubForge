@@ -18,6 +18,8 @@ export interface TaskRowDto {
   original_preview: string | null;
   translated_preview: string | null;
   error_message: string | null;
+  translate_fallback_count: number;
+  can_retry_translation: boolean;
 }
 
 export interface TaskListPanel {

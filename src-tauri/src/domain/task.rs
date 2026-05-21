@@ -132,6 +132,10 @@ pub struct TaskRecord {
     #[serde(default)]
     pub translate_note: Option<String>,
     #[serde(default)]
+    pub translate_fallback_count: u32,
+    #[serde(default)]
+    pub retry_translation_only: bool,
+    #[serde(default)]
     pub cancel_requested: bool,
     #[serde(default)]
     pub error_message: Option<String>,
@@ -352,7 +356,12 @@ impl TaskRecord {
             TRANSLATION_STAGE_TRANSLATING => "翻译中".into(),
             TRANSLATION_STAGE_EXPORTING => "导出中".into(),
             TRANSLATION_STAGE_COMPLETED => {
-                if let Some(n) = &self.translate_note {
+                if self.translate_fallback_count > 0 {
+                    format!(
+                        "已完成（{} 条片段翻译失败，已回退原文）",
+                        self.translate_fallback_count
+                    )
+                } else if let Some(n) = &self.translate_note {
                     format!("已完成（{n}）")
                 } else {
                     "已完成".into()

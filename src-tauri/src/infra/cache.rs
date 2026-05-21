@@ -7,6 +7,7 @@
 //!   - `w.srt` / `w.json`        Whisper 产物
 //!   - `cues.json`               分句 + 优化后的 SubCue 列表
 //!   - `translations.partial.json` 翻译增量（按原始 cue index 索引）
+//!   - `translations.fallback.json` 上一轮翻译中回退到原文的 cue 索引列表（用于"重新翻译失败片段"）
 
 use std::collections::HashMap;
 use std::fs;
@@ -25,6 +26,7 @@ const W_SRT_FILE: &str = "w.srt";
 const W_JSON_FILE: &str = "w.json";
 const CUES_FILE: &str = "cues.json";
 const PARTIAL_TRANSLATIONS_FILE: &str = "translations.partial.json";
+const FALLBACK_INDICES_FILE: &str = "translations.fallback.json";
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct StageStamp {
@@ -158,6 +160,7 @@ impl TaskCache {
             let _ = fs::remove_file(dir.join(W_JSON_FILE));
             let _ = fs::remove_file(dir.join(CUES_FILE));
             let _ = fs::remove_file(dir.join(PARTIAL_TRANSLATIONS_FILE));
+            let _ = fs::remove_file(dir.join(FALLBACK_INDICES_FILE));
         }
 
         let cache = TaskCache { dir, manifest };
@@ -186,6 +189,9 @@ impl TaskCache {
     }
     pub fn partial_translations_path(&self) -> PathBuf {
         self.dir.join(PARTIAL_TRANSLATIONS_FILE)
+    }
+    pub fn fallback_indices_path(&self) -> PathBuf {
+        self.dir.join(FALLBACK_INDICES_FILE)
     }
 
     fn save_manifest(&self) -> Result<(), String> {
@@ -230,6 +236,7 @@ impl TaskCache {
     fn invalidate_from_translate(&mut self) {
         self.manifest.translate = StageStamp::default();
         let _ = fs::remove_file(self.partial_translations_path());
+        let _ = fs::remove_file(self.fallback_indices_path());
     }
 
     pub fn mark_audio_done(&mut self, hash: &str) -> Result<(), String> {
@@ -321,6 +328,30 @@ impl TaskCache {
         let body = serde_json::to_string(&serializable).map_err(|e| e.to_string())?;
         fs::write(self.partial_translations_path(), body)
             .map_err(|e| format!("写入 partial translations 失败: {e}"))
+    }
+
+    pub fn load_fallback_indices(&self) -> Vec<usize> {
+        let path = self.fallback_indices_path();
+        if !path.is_file() {
+            return Vec::new();
+        }
+        let Ok(body) = fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut v: Vec<usize> = serde_json::from_str(&body).unwrap_or_default();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    pub fn save_fallback_indices(&self, indices: &[usize]) -> Result<(), String> {
+        let body = serde_json::to_string(indices).map_err(|e| e.to_string())?;
+        fs::write(self.fallback_indices_path(), body)
+            .map_err(|e| format!("写入 fallback indices 失败: {e}"))
+    }
+
+    pub fn clear_fallback_indices(&self) {
+        let _ = fs::remove_file(self.fallback_indices_path());
     }
 
     /// 成功完成任务后调用：删除整个缓存目录。

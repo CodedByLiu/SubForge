@@ -33,6 +33,13 @@ const TRAILING_TARGET_WORDS: &[&str] = &[
     "的", "了", "在", "把", "和", "与", "并", "将", "会", "去", "到", "对", "给", "通过",
 ];
 
+// 合并成句（stitch）阶段的上限：软上限是合并目标长度，硬上限即使无句末标点也强制断开。
+const STITCH_MAX_CHARS: usize = 90;
+const STITCH_MAX_DURATION_MS: i64 = 8000;
+const STITCH_HARD_MAX_CHARS: usize = 120;
+const STITCH_HARD_MAX_DURATION_MS: i64 = 12000;
+const STITCH_GAP_TOLERANCE_MS: i64 = 50;
+
 fn parse_ts(part: &str) -> Option<i64> {
     let p = part.trim();
     let (hms, ms_part) = if let Some((a, b)) = p.split_once(',') {
@@ -118,6 +125,13 @@ fn ends_with_terminal(text: &str) -> bool {
         || trimmed.ends_with('。')
         || trimmed.ends_with('！')
         || trimmed.ends_with('？')
+}
+
+fn ends_with_pause_punct(text: &str) -> bool {
+    matches!(
+        text.trim_end().chars().last(),
+        Some(',') | Some(';') | Some(':') | Some('，') | Some('；') | Some('：') | Some('、')
+    )
 }
 
 fn normalize_token(token: &str) -> String {
@@ -287,6 +301,76 @@ fn is_target_fragment(cue: &SubCue) -> bool {
         return true;
     }
     starts_with_any(text, LEADING_TARGET_WORDS) || ends_with_any(text, TRAILING_TARGET_WORDS)
+}
+
+/// `stitch_sentences` 的参数。`strong_boundaries_ms` 是由 Whisper 词级时间戳
+/// 推导出的"强停顿"时间点（毫秒），落在该处的相邻 cue 不跨合并；为空时退化为
+/// 纯标点 + 上下限驱动。
+pub struct StitchOptions {
+    pub max_chars: usize,
+    pub max_duration_ms: i64,
+    pub hard_max_chars: usize,
+    pub hard_max_duration_ms: i64,
+    pub strong_boundaries_ms: Vec<i64>,
+    pub gap_tolerance_ms: i64,
+}
+
+impl Default for StitchOptions {
+    fn default() -> Self {
+        Self {
+            max_chars: STITCH_MAX_CHARS,
+            max_duration_ms: STITCH_MAX_DURATION_MS,
+            hard_max_chars: STITCH_HARD_MAX_CHARS,
+            hard_max_duration_ms: STITCH_HARD_MAX_DURATION_MS,
+            strong_boundaries_ms: Vec::new(),
+            gap_tolerance_ms: STITCH_GAP_TOLERANCE_MS,
+        }
+    }
+}
+
+fn boundary_is_strong_gap(boundary_ms: i64, strong: &[i64], tol: i64) -> bool {
+    strong.iter().any(|&b| (b - boundary_ms).abs() <= tol)
+}
+
+fn should_stitch(prev: &SubCue, cue: &SubCue, opts: &StitchOptions) -> bool {
+    // 1. 上一条已是完整句子（句末标点结尾）—— 开新句。
+    if ends_with_terminal(&prev.text) {
+        return false;
+    }
+    // 2. 两条之间是强停顿边界 —— 在自然停顿处断开。
+    if boundary_is_strong_gap(prev.end_ms, &opts.strong_boundaries_ms, opts.gap_tolerance_ms) {
+        return false;
+    }
+    // 3. 合并会超过硬上限（字符或时长）—— 强制断开，杜绝超长 cue。
+    if !can_merge_texts(prev, cue, opts.hard_max_duration_ms, opts.hard_max_chars) {
+        return false;
+    }
+    // 4. 已达软上限（字符或时长）且当前停在自然停顿（逗号等）—— 在此收尾，避免拼出过长的 run-on。
+    if (visible_len(&prev.text) >= opts.max_chars || cue_duration(prev) >= opts.max_duration_ms)
+        && ends_with_pause_punct(&prev.text)
+    {
+        return false;
+    }
+    true
+}
+
+/// 把 Whisper/VAD 的声学碎片贪心重组成完整句子：相邻 cue 若上一条不以句末标点结尾、
+/// 且未命中强停顿边界、且合并后不超硬上限，则并入上一条。重组后的长句由后续
+/// `segment_cues` 按 `max_chars_per_segment` 拆回合适长度（并用 word-timing 对齐）。
+pub fn stitch_sentences(cues: &[SubCue], opts: &StitchOptions) -> Vec<SubCue> {
+    let mut out: Vec<SubCue> = Vec::with_capacity(cues.len());
+    for cue in cues.iter().cloned() {
+        if let Some(prev) = out.last_mut() {
+            if should_stitch(prev, &cue, opts) {
+                prev.end_ms = cue.end_ms;
+                prev.text = join_texts(&prev.text, &cue.text);
+                continue;
+            }
+        }
+        out.push(cue);
+    }
+    renumber(&mut out);
+    out
 }
 
 pub fn optimize_source_cues(cues: &[SubCue]) -> Vec<SubCue> {
@@ -657,7 +741,8 @@ pub fn build_bilingual_cues_optimized(
 mod tests {
     use super::{
         apply_recognition_glossary, build_bilingual_cues_optimized, build_recognition_prompt,
-        normalize_cues_for_srt, optimize_source_cues, optimize_translated_cues, SubCue,
+        normalize_cues_for_srt, optimize_source_cues, optimize_translated_cues, stitch_sentences,
+        StitchOptions, SubCue,
     };
     use crate::domain::config::GlossaryEntry;
 
@@ -878,5 +963,80 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].text.contains("通过"));
         assert!(out[0].text.contains("do that by"));
+    }
+
+    fn timed_cue(start_ms: i64, end_ms: i64, text: &str) -> SubCue {
+        SubCue {
+            index: 1,
+            start_ms,
+            end_ms,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn stitch_merges_phrase_split_mid_sentence() {
+        // data/"2. How to Take this Course_en.srt" cue1+cue2: "super | excited" 不应被拆开。
+        let cues = vec![
+            timed_cue(420, 1320, "I know that we are super"),
+            timed_cue(
+                1320,
+                4880,
+                "excited to start this course,but I just need to do some short housekeeping",
+            ),
+        ];
+        let out = stitch_sentences(&cues, &StitchOptions::default());
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.contains("super excited"));
+        assert_eq!(out[0].start_ms, 420);
+        assert_eq!(out[0].end_ms, 4880);
+    }
+
+    #[test]
+    fn stitch_merges_into_complete_sentence() {
+        // cue6+cue7: "get excited about" + "the topic." → 合并成完整句。
+        let cues = vec![
+            timed_cue(17830, 19350, "get excited about"),
+            timed_cue(19350, 20590, "the topic."),
+        ];
+        let out = stitch_sentences(&cues, &StitchOptions::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "get excited about the topic.");
+    }
+
+    #[test]
+    fn stitch_respects_strong_gap_boundary() {
+        let cues = vec![
+            timed_cue(0, 1000, "this is the first part"),
+            timed_cue(1600, 2400, "and a separate thought"),
+        ];
+        let opts = StitchOptions {
+            strong_boundaries_ms: vec![1000],
+            ..StitchOptions::default()
+        };
+        let out = stitch_sentences(&cues, &opts);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn stitch_keeps_terminal_sentence_separate() {
+        let cues = vec![
+            timed_cue(0, 1000, "Hello world."),
+            timed_cue(1000, 2000, "Next sentence begins here"),
+        ];
+        let out = stitch_sentences(&cues, &StitchOptions::default());
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn stitch_force_breaks_at_hard_limit() {
+        // 无句末标点的超长串：合并到硬上限即断，不会拼成一条巨型 cue。
+        let long = "word ".repeat(40); // ~200 字符，无标点
+        let cues = vec![
+            timed_cue(0, 2000, long.trim()),
+            timed_cue(2000, 4000, "another chunk of text without any ending"),
+        ];
+        let out = stitch_sentences(&cues, &StitchOptions::default());
+        assert_eq!(out.len(), 2);
     }
 }

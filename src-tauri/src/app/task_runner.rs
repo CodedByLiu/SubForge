@@ -28,10 +28,12 @@ use crate::infra::secrets;
 use crate::infra::srt::{
     apply_recognition_glossary, build_bilingual_cues_optimized, build_recognition_prompt,
     build_translated_cues, format_srt, optimize_source_cues, optimize_translated_cues, parse_srt,
-    SubCue,
+    stitch_sentences, StitchOptions, SubCue,
 };
 use crate::infra::subtitle_output::{resolve_bilingual_srt_path, resolve_original_srt_path};
-use crate::infra::subtitle_segmentation::{segment_cues, SegmentationJob};
+use crate::infra::subtitle_segmentation::{
+    extract_strong_boundaries, segment_cues, SegmentationJob,
+};
 use crate::infra::task_store;
 use crate::infra::whisper_models::model_file_path;
 use crate::infra::whisper_runtime;
@@ -334,6 +336,7 @@ struct JobSnapshot {
     segmentation_timing_mode: String,
     segmentation_max_chars: u32,
     segmentation_max_duration_ms: u32,
+    segmentation_sentence_gap_ms: u32,
     translator_provider_url: String,
     translator_use_proxy: bool,
     llm_base_url: String,
@@ -458,6 +461,7 @@ fn load_job(ts: &Arc<Mutex<TaskStoreFile>>, task_id: &str, cfg: &AppConfig) -> O
         } else {
             (cfg.segmentation.max_duration_seconds.max(0.0) * 1000.0).round() as u32
         },
+        segmentation_sentence_gap_ms: cfg.segmentation.sentence_gap_ms,
         translator_provider_url: if snap && !t.snapshot_translator_provider_url.trim().is_empty() {
             t.snapshot_translator_provider_url.clone()
         } else {
@@ -1004,6 +1008,7 @@ fn run_one_task(
         job.segmentation_timing_mode.as_str(),
         &job.segmentation_max_chars.to_string(),
         &job.segmentation_max_duration_ms.to_string(),
+        &job.segmentation_sentence_gap_ms.to_string(),
         if job.segmentation_strategy != "disabled" {
             job.llm_model.as_str()
         } else {
@@ -1133,6 +1138,20 @@ fn run_one_task(
                 llm_api_key: llm_api_key_storage.as_str(),
                 llm_timeout_sec: job.llm_timeout_sec,
             };
+
+            // 先把 VAD 声学碎片贪心重组成完整句子，再交给 segment_cues 按长度拆回。
+            // 词级时间戳可用时（word_timestamps_first）据"强停顿"细化句边界，否则退化为标点+上下限驱动。
+            let strong_boundaries = if job.segmentation_timing_mode == "word_timestamps_first" {
+                extract_strong_boundaries(&json_path, job.segmentation_sentence_gap_ms as i64)
+            } else {
+                Vec::new()
+            };
+            let stitch_opts = StitchOptions {
+                strong_boundaries_ms: strong_boundaries,
+                ..StitchOptions::default()
+            };
+            working = stitch_sentences(&working, &stitch_opts);
+
             match segment_cues(&seg_client, &seg_job, &working, Some(&json_path)) {
                 Ok(res) => {
                     working = res.cues;

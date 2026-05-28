@@ -752,6 +752,25 @@ fn extract_time_units_from_whisper_json(path: &Path) -> Result<Vec<TimeUnit>, St
     Ok(units)
 }
 
+/// 从 Whisper 词级时间戳推导"强停顿"时间点：相邻词单元间隔 `gap >= gap_ms` 处，
+/// 取前一个单元的 `end_ms` 作为边界候选。无 JSON / 解析失败时返回空（合并阶段据此退化）。
+pub fn extract_strong_boundaries(path: &Path, gap_ms: i64) -> Vec<i64> {
+    let units = match extract_time_units_from_whisper_json(path) {
+        Ok(u) => u,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::<i64>::new();
+    for pair in units.windows(2) {
+        let gap = pair[1].start_ms - pair[0].end_ms;
+        if gap >= gap_ms {
+            out.push(pair[0].end_ms);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn collect_time_units(value: &Value, out: &mut Vec<TimeUnit>, words_only: bool) {
     match value {
         Value::Array(items) => {

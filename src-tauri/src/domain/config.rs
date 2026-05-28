@@ -94,6 +94,9 @@ pub struct SegmentationConfig {
     pub max_chars_per_segment: u32,
     pub max_duration_seconds: f64,
     pub timing_mode: String,
+    /// 合并成句阶段的"强停顿"阈值（毫秒）：相邻词级时间戳间隔超过该值即视为句边界，不跨合并。
+    #[serde(default = "default_sentence_gap_ms")]
+    pub sentence_gap_ms: u32,
 }
 
 impl Default for SegmentationConfig {
@@ -103,6 +106,7 @@ impl Default for SegmentationConfig {
             max_chars_per_segment: 42,
             max_duration_seconds: 6.0,
             timing_mode: "word_timestamps_first".into(),
+            sentence_gap_ms: default_sentence_gap_ms(),
         }
     }
 }
@@ -200,6 +204,10 @@ fn default_vad_max_segment_ms() -> u32 {
     30_000
 }
 
+fn default_sentence_gap_ms() -> u32 {
+    500
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -228,7 +236,7 @@ impl Default for AppConfig {
                 ffmpeg_path: String::new(),
                 whisper_cli_path: String::new(),
                 download_url: String::new(),
-                mirror_url: String::new(),
+                mirror_url: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main".into(),
                 prefer_mirror: true,
                 recognition_glossary: Vec::new(),
                 recognition_glossary_case_sensitive: false,
@@ -298,6 +306,9 @@ impl AppConfig {
             || self.segmentation.max_duration_seconds > 60.0
         {
             return Err("原字幕单条最大持续时长需在 0.5–60 秒之间".into());
+        }
+        if self.segmentation.sentence_gap_ms < 100 || self.segmentation.sentence_gap_ms > 3000 {
+            return Err("分句停顿阈值需在 100–3000 毫秒之间".into());
         }
         if self.runtime.max_parallel_tasks == 0 || self.runtime.max_parallel_tasks > 16 {
             return Err("最大并发任务数需在 1–16 之间".into());

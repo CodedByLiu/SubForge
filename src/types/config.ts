@@ -122,7 +122,7 @@ export function defaultAppConfig(): AppConfig {
       ffmpeg_path: "",
       whisper_cli_path: "",
       download_url: "",
-      mirror_url: "",
+      mirror_url: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main",
       prefer_mirror: true,
       recognition_glossary: [],
       recognition_glossary_case_sensitive: false,
